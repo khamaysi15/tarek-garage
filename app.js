@@ -106,6 +106,13 @@ async function compressImage(file, max = 1600, q = 0.82) {
 /* ---------- cloud config (Supabase) ---------- */
 const CLOUD = { url: 'https://yopertfgqpdxxufdaomr.supabase.co', key: 'sb_publishable_RXi0Ty121HdhWB1-Lhg5-g_SMUrIG_i' };   // public browser key – data is protected by login + row-level security
 let sb = null;
+let me = null;   // signed-in person's profile: { user_id, name, email, role: 'admin'|'worker', employee_id, active }
+const isAdmin = () => !sb || !!(me && me.role === 'admin');
+async function loadMe() {
+  const { data: { session } } = await sb.auth.getSession(); if (!session) return null;
+  const { data, error } = await sb.from('profiles').select('*').eq('user_id', session.user.id).maybeSingle();
+  if (error) throw error; return data;
+}
 async function cloudInit() {
   if (!CLOUD.url || !CLOUD.key) return null;
   if (!window.supabase) await loadScript('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js');
@@ -335,14 +342,41 @@ const OCR = {
   },
 };
 
-/* ---------- cloud transcription fallback (optional, OpenAI key per device) ---------- */
-async function cloudTranscribe(blob) {
-  const key = local.get('openaiKey'); if (!key) throw new Error('no key');
-  const ext = /mp4|m4a|aac/.test(blob.type) ? 'm4a' : /ogg/.test(blob.type) ? 'ogg' : /wav/.test(blob.type) ? 'wav' : /mpeg|mp3/.test(blob.type) ? 'mp3' : 'webm';
-  const fd = new FormData(); fd.append('file', blob, 'rec.' + ext); fd.append('model', 'whisper-1'); fd.append('language', 'he');
-  const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + key }, body: fd });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return ((await r.json()).text || '').trim();
+/* ---------- AI on the garage server (Gemini via Supabase function "garage") ---------- */
+const toB64 = blob => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1] || ''); fr.onerror = rej; fr.readAsDataURL(blob); });
+async function garageCall(body) {
+  const { data, error } = await sb.functions.invoke('garage', { body });
+  if (error) { let m = error.message; try { const j = await error.context.json(); m = j.error || m; } catch { } throw new Error(m); }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+const aiOn = () => !!sb && local.get('aiOff') !== '1';
+// iPhone records AAC/MP4; convert to small 16 kHz mono WAV so the AI accepts any phone's format
+async function toWav16k(blob) {
+  const AC = window.AudioContext || window.webkitAudioContext; const ac = new AC();
+  const ab = await new Response(blob).arrayBuffer();
+  const buf = await new Promise((res, rej) => ac.decodeAudioData(ab, res, rej));
+  try { ac.close(); } catch { }
+  const rate = 16000, len = Math.max(1, Math.ceil(buf.duration * rate));
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const off = new OAC(1, len, rate); const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start(0);
+  const out = await off.startRendering(); const d = out.getChannelData(0);
+  const wav = new ArrayBuffer(44 + d.length * 2), v = new DataView(wav);
+  const w = (o, t) => { for (let k = 0; k < t.length; k++) v.setUint8(o + k, t.charCodeAt(k)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + d.length * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, d.length * 2, true);
+  for (let k = 0; k < d.length; k++) { const x = Math.max(-1, Math.min(1, d[k])); v.setInt16(44 + k * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true); }
+  return new Blob([wav], { type: 'audio/wav' });
+}
+async function aiTranscribe(blob) {
+  let a = blob; try { a = await toWav16k(blob); } catch (e) { console.warn('wav convert failed, sending original', e); }
+  const r = await garageCall({ action: 'transcribe', audio: await toB64(a), mime: (a.type || 'audio/mp4').split(';')[0] });
+  return (r.text || '').trim();
+}
+async function aiPlate(blob) {
+  const small = await compressImage(blob, 1600, 0.85);
+  const r = await garageCall({ action: 'plate', image: await toB64(small), mime: 'image/jpeg' });
+  return r.plate || null;
 }
 
 /* ---------- UI building blocks ---------- */
@@ -387,7 +421,9 @@ function Recorder() {
   const listEl = h('div');
   const audioIn = h('input', { type: 'file', accept: 'audio/*', hidden: true });
   const srOn = () => SR && local.get('liveTranscribe', '1') === '1';
-  const hint = h('p', { class: 'hint' }, srOn()
+  const hint = h('p', { class: 'hint' }, sb && local.get('aiOff') !== '1'
+    ? 'לחץ "התחל הקלטה", דבר בעברית, ולחץ "סיים הקלטה". הקול נשמר, והטקסט נכתב ומשופר אוטומטית מההקלטה – אפשר לתקן אותו.'
+    : srOn()
     ? 'לחץ "התחל הקלטה", דבר בעברית, ולחץ "סיים הקלטה". הקול נשמר והדיבור נכתב אוטומטית – אפשר לתקן את הכתוב.'
     : 'ההקלטה תישמר. תמלול חי לא זמין בדפדפן הזה – אפשר להקליד את התמלול, או להשתמש במיקרופון של המקלדת.');
   const el = h('div', { class: 'rec-zone' }, btn, live, listEl,
@@ -460,18 +496,25 @@ function Recorder() {
   function addRec(blob, dur, transcript) {
     const rec = { id: uid(), blob, url: URL.createObjectURL(blob), mime: blob.type, duration: dur, transcript: transcript || '' };
     list.push(rec); render(); setBtn();
-    if (!rec.transcript && local.get('openaiKey')) runCloud(rec);
+    if (aiOn()) runCloud(rec);
   }
-  async function runCloud(rec) {
+  async function runCloud(rec, manual) {
     rec.busy = true; render();
-    try { rec.transcript = await cloudTranscribe(rec.blob); toast('התמלול מוכן', 'ok'); }
-    catch (e) { toast('תמלול בענן נכשל – אפשר להקליד ידנית', 'bad'); }
+    try {
+      const text = await aiTranscribe(rec.blob);
+      if (text && (!rec.edited || manual)) { rec.transcript = text; rec.edited = false; rec.suggest = null; }
+      else if (text && text !== rec.transcript) rec.suggest = text;
+      if (!text && !rec.transcript) toast('לא זוהה דיבור בהקלטה', 'bad');
+    } catch (e) {
+      console.warn(e);
+      if (!rec.transcript) toast('שיפור התמלול לא הצליח – אפשר להקליד ידנית', 'bad');
+    }
     rec.busy = false; render();
   }
   function render() {
     fill(listEl, ...list.map((rec, i) => {
       const ta = h('textarea', { class: 'input', rows: 3, placeholder: 'כאן יופיע מה שנאמר. אפשר להקליד או לתקן.', value: rec.transcript });
-      ta.addEventListener('input', () => { rec.transcript = ta.value; });
+      ta.addEventListener('input', () => { rec.transcript = ta.value; rec.edited = true; });
       return h('div', { class: 'rec-card' },
         h('div', { class: 'rec-head' }, ic('mic'), h('span', { class: 'grow' }, 'הקלטה ' + (i + 1) + (rec.duration ? ' · ' + fmtDur(rec.duration) : '')),
           h('button', { type: 'button', class: 'btn sm danger', onclick: () => {
@@ -479,9 +522,11 @@ function Recorder() {
             URL.revokeObjectURL(rec.url); list.splice(i, 1); render(); setBtn();
           } }, ic('trash'), 'מחק')),
         h('audio', { controls: true, preload: 'metadata', src: rec.url }),
-        h('div', { class: 'tr-lbl' }, rec.busy ? h('span', {}, h('span', { class: 'spin' }), ' מתמלל…') : 'מה נאמר בהקלטה (תמלול – אפשר לתקן):'),
+        h('div', { class: 'tr-lbl' }, rec.busy ? h('span', {}, h('span', { class: 'spin' }), ' משפר את התמלול מההקלטה…') : 'מה נאמר בהקלטה (תמלול – אפשר לתקן):'),
         ta,
-        local.get('openaiKey') && !rec.busy && h('button', { type: 'button', class: 'btn sm', style: 'margin-top:8px', onclick: () => runCloud(rec) }, 'תמלל מחדש מההקלטה'));
+        rec.suggest && h('div', { class: 'ocr-status ok', style: 'margin-top:8px' }, h('div', {}, 'תמלול משופר: ', rec.suggest),
+          h('button', { type: 'button', class: 'btn sm ok', style: 'margin-top:6px', onclick: () => { rec.transcript = rec.suggest; rec.suggest = null; rec.edited = false; render(); } }, 'השתמש בתמלול המשופר')),
+        aiOn() && !rec.busy && h('button', { type: 'button', class: 'btn sm', style: 'margin-top:8px', onclick: () => runCloud(rec, true) }, 'תמלל שוב מההקלטה'));
     }));
   }
   btn.onclick = () => (st ? stop() : start());
@@ -493,10 +538,10 @@ function Recorder() {
     audioIn.value = '';
   };
   setBtn();
-  return { el, list, isRecording: () => !!st, cleanup() { cancel(); } };
+  return { el, list, isRecording: () => !!st, busy: () => list.some(r => r.busy), cleanup() { cancel(); } };
 }
 
-function Photos() {
+function Photos(onAdd) {
   const list = [];
   const box = h('div');
   const cam = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
@@ -505,8 +550,10 @@ function Photos() {
   async function add(files) {
     if (!files.length) return;
     status.hidden = false; fill(status, h('span', { class: 'spin' }), ' מעבד תמונות…');
-    for (const f of files) { const b = await compressImage(f); list.push({ blob: b, url: URL.createObjectURL(b) }); }
+    const added = [];
+    for (const f of files) { const b = await compressImage(f); list.push({ blob: b, url: URL.createObjectURL(b) }); added.push(b); }
     status.hidden = true; render();
+    if (onAdd && added.length) onAdd(added[0]);
   }
   cam.onchange = () => { add([...cam.files]); cam.value = ''; };
   gal.onchange = () => { add([...gal.files]); gal.value = ''; };
@@ -522,9 +569,9 @@ function Photos() {
 }
 
 /* text + recordings + photos – used for new reports and for additions */
-function Composer(title = 'מה העבודה שבוצעה') {
+function Composer(title = 'מה העבודה שבוצעה', opts = {}) {
   const ta = h('textarea', { class: 'input', rows: 4, placeholder: 'כתוב כאן מה בוצע… (אפשר גם רק להקליט)' });
-  const rec = Recorder(); const ph = Photos();
+  const rec = Recorder(); const ph = Photos(opts.onPhoto);
   const el = h('div', {},
     h('div', { class: 'card' }, h('h3', {}, title),
       h('label', { class: 'lbl' }, 'דיווח בדיבור (מומלץ)'), rec.el,
@@ -538,6 +585,11 @@ function Composer(title = 'מה העבודה שבוצעה') {
     cleanup: () => rec.cleanup(),
   };
 }
+async function waitTranscripts(comp, btn) {
+  if (!comp.rec.busy()) return;
+  if (btn) fill(btn, h('span', { class: 'spin' }), ' מסיים תמלול…');
+  for (let i = 0; i < 120 && comp.rec.busy(); i++) await sleep(250);
+}
 async function buildEntry(comp, worker, kind, at) {
   const recordings = [];
   for (const r of comp.rec.list) recordings.push({ id: uid(), blobId: await saveBlob(r.blob), mime: r.mime, duration: r.duration, transcript: (r.transcript || '').trim() });
@@ -547,12 +599,18 @@ async function buildEntry(comp, worker, kind, at) {
 }
 
 async function WorkerPicker(label = 'שם העובד') {
+  if (sb && me && me.role !== 'admin') {
+    const w = { id: me.employee_id || 'u-' + me.user_id, name: me.name };
+    return { el: h('div', { class: 'card' }, h('label', { class: 'lbl' }, label), h('div', { class: 'chips workers' }, h('span', { class: 'chip on' }, ic('user'), ' ', w.name)),
+      h('p', { class: 'hint' }, 'העבודה נרשמת על שמך לפי הכניסה למערכת.')), get: () => w };
+  }
   let emps = await employees(); let sel = null;
+  if (sb && me && emps.some(e => e.id === me.employee_id)) sel = me.employee_id;
   const last = local.get('lastWorker'); if (last && emps.some(e => e.id === last)) sel = last;
   const wrap = h('div', { class: 'chips workers' });
   const render = () => {
     fill(wrap, ...emps.map(e => h('button', { type: 'button', class: 'chip' + (e.id === sel ? ' on' : ''), onclick: () => { sel = e.id; render(); } }, e.name)),
-      h('button', { type: 'button', class: 'chip', onclick: async () => {
+      !sb && h('button', { type: 'button', class: 'chip', onclick: async () => {
         const n = (prompt('שם העובד החדש:') || '').trim(); if (!n) return;
         const e = { id: uid(), name: n, active: true, createdAt: Date.now() }; await DB.put('employees', e);
         emps = await employees(); sel = e.id; render();
@@ -649,7 +707,12 @@ async function route() {
   fill(view, h('div', { class: 'empty' }, h('span', { class: 'spin' })));
   document.body.classList.remove('locked');
   try {
-    if (sb) { const { data } = await sb.auth.getSession(); if (!data.session) { await viewLogin(); return; } }
+    if (sb) {
+      const { data } = await sb.auth.getSession();
+      if (!data.session) { me = null; await viewLogin(); return; }
+      if (!me || me.user_id !== data.session.user.id) me = await loadMe();
+      if (!me || !me.active) { viewNoAccess(); return; }
+    }
     if (!p.length) await viewHome();
     else if (p[0] === 'new' && (p[1] === 'truck' || p[1] === 'trailer')) await viewNew(p[1], q.get('plate'));
     else if (p[0] === 'new') await viewPick();
@@ -675,6 +738,13 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ---------- login (one garage account per phone, stays signed in) ---------- */
+function viewNoAccess() {
+  setHeader('', 'אין הרשאה');
+  document.body.classList.add('locked');
+  fill(view, h('div', { class: 'card' }, h('h3', {}, 'למשתמש הזה אין גישה למערכת'),
+    h('p', {}, 'ייתכן שהמשתמש הושבת או עדיין לא הוגדר. פנה למנהל המוסך.'),
+    h('button', { type: 'button', class: 'btn', onclick: async () => { await sb.auth.signOut(); me = null; route(); } }, 'התנתק')));
+}
 async function viewLogin() {
   setHeader('', 'כניסה למערכת המוסך');
   document.body.classList.add('locked');
@@ -692,7 +762,7 @@ async function viewLogin() {
     const { error } = await sb.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
     btn.disabled = false; fill(btn, 'כניסה');
     if (error) { msg.hidden = false; msg.textContent = /invalid/i.test(error.message) ? 'אימייל או סיסמה לא נכונים.' : niceErr(error); return; }
-    toast('נכנסת בהצלחה ✓', 'ok'); route();
+    me = null; toast('נכנסת בהצלחה ✓', 'ok'); route();
   });
   fill(view, form);
 }
@@ -706,7 +776,7 @@ async function moveLocalToCloud(statusEl) {
   const say = t => { if (statusEl) fill(statusEl, h('span', { class: 'spin' }), ' ' + t); };
   const reports = (await LocalDB.all('reports')).filter(r => !r.demo);
   const emps = (await LocalDB.all('employees')).filter(e => !e.demo);
-  for (const e of emps) if (!(await Remote.get('employees', e.id))) await Remote.put('employees', e);
+  if (isAdmin()) for (const e of emps) if (!(await Remote.get('employees', e.id))) await Remote.put('employees', e);
   let i = 0;
   for (const r of reports) {
     say('מעביר עבודה ' + (++i) + ' מתוך ' + reports.length + '…');
@@ -794,7 +864,10 @@ async function viewHome() {
     demoNote(),
     h('h3', { style: 'margin:6px 2px 10px' }, 'עבודות אחרונות'),
     recent.length ? recent.map(r => reportItem(r)) : h('div', { class: 'empty' }, 'עדיין אין עבודות. לחץ "משאית" או "נגרר" כדי לדווח.'),
-    h('div', { style: 'text-align:center;margin-top:18px' }, h('a', { class: 'btn sm', href: '#/admin' }, ic('gear'), 'מסך מנהל')));
+    h('div', { style: 'text-align:center;margin-top:18px' },
+      isAdmin() && h('a', { class: 'btn sm', href: '#/admin' }, ic('gear'), 'מסך מנהל'),
+      sb && me && h('p', { class: 'hint' }, 'מחובר: ', h('b', {}, me.name), me.role === 'admin' ? ' (מנהל)' : '', ' · ',
+        h('a', { href: '#', onclick: async e => { e.preventDefault(); if (!confirm('להתנתק מהטלפון הזה?')) return; await sb.auth.signOut(); me = null; route(); } }, 'התנתקות'))));
 }
 async function viewPick() {
   setHeader('new');
@@ -810,28 +883,31 @@ function PlateField(onChange, opts = {}) {
   let t = null;
   input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => onChange(normPlate(input.value)), 350); });
   input.addEventListener('blur', () => { if (normPlate(input.value)) input.value = fmtPlate(input.value); });
+  async function recognize(blob, fromPhotos) {
+    if (fromPhotos && normPlate(input.value)) return;
+    if (!fromPhotos || !state.image) { state.image = blob; preview.src = URL.createObjectURL(blob); preview.hidden = !opts.keepPhoto; }
+    status.hidden = false; status.className = 'ocr-status'; fill(status, h('span', { class: 'spin' }), fromPhotos ? ' מחפש את מספר הרישוי בתמונה…' : ' מזהה את מספר הרישוי…');
+    let plate = null, failed = false;
+    if (aiOn()) { try { plate = await aiPlate(blob); } catch (e) { console.warn('AI plate failed', e); failed = true; } }
+    if (!plate && (!aiOn() || failed)) { try { plate = (await OCR.readPlate(blob)).plate; } catch (e) { console.warn(e); } }
+    if (fromPhotos && normPlate(input.value)) { status.hidden = true; return; } // the worker typed meanwhile
+    if (plate) {
+      input.value = fmtPlate(plate); onChange(plate);
+      status.className = 'ocr-status ok'; status.textContent = '✓ זוהה: ' + fmtPlate(plate) + ' – בדוק שהמספר נכון. אם לא, תקן בשדה.';
+    } else if (fromPhotos) {
+      status.hidden = true;
+    } else {
+      status.className = 'ocr-status bad'; status.textContent = 'לא הצלחתי לקרוא את המספר. צלם שוב כך שהלוחית תיראה, או הקלד ידנית.';
+    }
+  }
   file.onchange = async () => {
     const f = file.files[0]; file.value = ''; if (!f) return;
-    const blob = await compressImage(f, 2000, 0.9); state.image = blob;
-    preview.src = URL.createObjectURL(blob); preview.hidden = !opts.keepPhoto;
-    status.hidden = false; status.className = 'ocr-status'; fill(status, h('span', { class: 'spin' }), ' מזהה את מספר הרישוי…');
-    try {
-      const r = await OCR.readPlate(blob);
-      if (r.plate) {
-        input.value = fmtPlate(r.plate); onChange(r.plate);
-        status.className = 'ocr-status ok'; status.textContent = '✓ זוהה: ' + fmtPlate(r.plate) + ' – בדוק שהמספר נכון. אם לא, תקן בשדה.';
-      } else {
-        status.className = 'ocr-status bad'; status.textContent = 'לא הצלחתי לקרוא את המספר. צלם שוב קרוב יותר וישר, או הקלד ידנית.';
-      }
-    } catch (e) {
-      console.warn(e);
-      status.className = 'ocr-status bad'; status.textContent = 'הזיהוי האוטומטי לא זמין כרגע (נדרש אינטרנט בפעם הראשונה). הקלד את המספר ידנית.';
-    }
+    recognize(await compressImage(f, 2000, 0.9));
   };
   const el = h('div', {}, input, file,
-    h('button', { type: 'button', class: 'btn wide', style: 'margin-top:10px', onclick: () => file.click() }, ic('camera'), 'צלם מספר רישוי'),
+    h('button', { type: 'button', class: 'btn wide', style: 'margin-top:10px', onclick: () => file.click() }, ic('camera'), 'צלם את הרכב או את הלוחית'),
     status, preview);
-  return { el, input, state, value: () => normPlate(input.value) };
+  return { el, input, state, recognize, value: () => normPlate(input.value) };
 }
 
 async function viewNew(type, prePlate) {
@@ -864,7 +940,7 @@ async function viewNew(type, prePlate) {
         h('button', { type: 'button', class: 'btn sm', onclick: () => showVehicleSheet(p) }, ic('clock'), 'טיפולים קודמים'),
         today && h('button', { type: 'button', class: 'btn sm ok', onclick: () => go('#/report/' + today.id + '/add') }, ic('plus'), 'המשך את הדיווח מהיום')));
   }
-  const comp = Composer();
+  const comp = Composer(undefined, { onPhoto: b => { if (!plate.value()) plate.recognize(b, true); } });
   const worker = await WorkerPicker('שם העובד שביצע את העבודה');
   const when = h('div', { class: 'when' }, ic('clock'));
   const tick = () => { when.lastChild.nodeType === 3 && when.lastChild.remove(); when.append('התאריך והשעה יישמרו אוטומטית: ' + fmtDT(Date.now())); };
@@ -888,6 +964,7 @@ async function viewNew(type, prePlate) {
     if (p.length < 5) { alert('הכנס מספר רישוי (או צלם את הלוחית).'); plate.input.focus(); return; }
     if (comp.rec.isRecording()) { alert('יש הקלטה פעילה – לחץ קודם "סיים הקלטה".'); return; }
     if (!comp.has()) { alert('תאר את העבודה: הקלטה, כתיבה או תמונה.'); return; }
+    if (comp.rec.busy()) { saveBtn.disabled = true; await waitTranscripts(comp, saveBtn); saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור עבודה'); }
     const w = worker.get(); if (!w) { alert('בחר את השם שלך מרשימת העובדים.'); return; }
     const kmVal = +km.value.replace(/\D/g, '') || null;
     if (isTruck && !kmVal && !confirm('לא הוזנו קילומטרים. לשמור בכל זאת?')) return;
@@ -996,6 +1073,7 @@ async function viewAdd(id) {
   saveBtn.onclick = async () => {
     if (comp.rec.isRecording()) { alert('יש הקלטה פעילה – לחץ קודם "סיים הקלטה".'); return; }
     if (!comp.has()) { alert('אין מה לשמור – הקלט, כתוב או צלם.'); return; }
+    if (comp.rec.busy()) { saveBtn.disabled = true; await waitTranscripts(comp, saveBtn); saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור תוספת'); }
     const w = worker.get(); if (!w) { alert('בחר את השם שלך.'); return; }
     saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
     try {
@@ -1068,7 +1146,8 @@ async function viewEdit(id) {
 
 /* ---------- admin ---------- */
 async function viewAdmin(tab) {
-  const pin = await DB.setting('adminPin');
+  if (!isAdmin()) { toast('מסך המנהל פתוח רק למנהלים', 'bad'); go('#/'); return; }
+  const pin = sb ? null : await DB.setting('adminPin');
   let unlocked = false; try { unlocked = sessionStorage.getItem('tg_admin') === '1'; } catch { }
   if (pin && !unlocked) {
     const v = prompt('קוד מנהל:');
@@ -1076,11 +1155,11 @@ async function viewAdmin(tab) {
     try { sessionStorage.setItem('tg_admin', '1'); } catch { }
   }
   setHeader('', 'מסך מנהל', '#/');
-  const tabs = h('div', { class: 'subtabs' }, [['works', 'כל העבודות'], ['workers', 'עובדים'], ['changes', 'מי ערך מה'], ['settings', 'הגדרות וגיבוי']]
+  const tabs = h('div', { class: 'subtabs' }, [['works', 'כל העבודות'], ['workers', sb ? 'משתמשים' : 'עובדים'], ['changes', 'מי ערך מה'], ['settings', 'הגדרות וגיבוי']]
     .map(([k, l]) => h('a', { href: '#/admin/' + k, class: tab === k ? 'on' : '' }, l)));
   const body = h('div');
   fill(view, tabs, body);
-  if (tab === 'workers') return adminWorkers(body);
+  if (tab === 'workers') return sb ? adminUsers(body) : adminWorkers(body);
   if (tab === 'changes') return adminChanges(body);
   if (tab === 'settings') return adminSettings(body);
   return adminWorks(body);
@@ -1133,6 +1212,51 @@ async function adminWorkers(body) {
         : h('p', { class: 'hint' }, 'אין עובדים עדיין.'),
       h('p', { class: 'hint' }, 'עובד מושבת לא מופיע ברשימת הבחירה, אבל העבודות שלו נשמרות.')));
 }
+const USER_ERR = {
+  bad_input: 'מלא שם, אימייל וסיסמה (לפחות 6 תווים).',
+  bad_password: 'הסיסמה צריכה להיות לפחות 6 תווים.',
+  cannot_lock_yourself_out: 'אי אפשר להשבית את עצמך או להוריד את עצמך מניהול.',
+  admins_only: 'רק מנהל יכול לנהל משתמשים.',
+};
+const userErr = e => { const m = String(e && e.message || e); return USER_ERR[m] || (/already been registered|already exists/i.test(m) ? 'כבר קיים משתמש עם האימייל הזה.' : niceErr(e)); };
+async function adminUsers(body) {
+  let users;
+  try { users = (await garageCall({ action: 'listUsers' })).users || []; }
+  catch (e) { addTo(body, h('div', { class: 'card' }, h('h3', {}, 'לא הצלחתי לטעון משתמשים'), h('p', {}, userErr(e)))); return; }
+  const call = async (payload, okMsg) => { try { await garageCall(payload); toast(okMsg, 'ok'); me = null; route(); } catch (e) { alert(userErr(e)); } };
+  const f = {
+    name: h('input', { class: 'input', placeholder: 'שם מלא (יופיע על העבודות)', autocomplete: 'off' }),
+    email: h('input', { class: 'input', type: 'email', dir: 'ltr', placeholder: 'email', autocomplete: 'off' }),
+    pass: h('input', { class: 'input', type: 'text', dir: 'ltr', placeholder: 'סיסמה – לפחות 6 תווים', autocomplete: 'new-password' }),
+    role: h('select', { class: 'input' }, h('option', { value: 'worker' }, 'עובד – מדווח עבודות'), h('option', { value: 'admin' }, 'מנהל – גם מסך מנהל וניהול משתמשים')),
+  };
+  const addBtn = h('button', { type: 'button', class: 'btn primary wide', style: 'margin-top:12px' }, ic('plus'), 'צור משתמש');
+  addBtn.onclick = async () => {
+    addBtn.disabled = true;
+    await call({ action: 'createUser', name: f.name.value.trim(), email: f.email.value.trim(), password: f.pass.value, role: f.role.value }, 'המשתמש נוצר ✓');
+    addBtn.disabled = false;
+  };
+  const row = u => {
+    const self = me && u.user_id === me.user_id;
+    return h('div', { class: 'emp' + (u.active ? '' : ' off') },
+      h('div', { class: 'grow' },
+        h('div', { class: 'name', style: 'font-weight:700' }, u.name || '—', self ? ' (אתה)' : ''),
+        h('div', { class: 'hint', style: 'margin:0', dir: 'ltr' }, u.email || ''),
+        h('div', { class: 'hint', style: 'margin:0' }, (u.role === 'admin' ? 'מנהל' : 'עובד') + (u.active ? '' : ' · מושבת'))),
+      h('div', { class: 'row', style: 'gap:6px;justify-content:flex-end' },
+        h('button', { type: 'button', class: 'btn sm', onclick: () => { const n = (prompt('שם חדש:', u.name) || '').trim(); if (n && n !== u.name) call({ action: 'updateUser', user_id: u.user_id, name: n }, 'השם עודכן'); } }, 'שם'),
+        h('button', { type: 'button', class: 'btn sm', onclick: () => { const pw = prompt('סיסמה חדשה עבור ' + u.name + ' (לפחות 6 תווים):'); if (pw) call({ action: 'updateUser', user_id: u.user_id, password: pw }, 'הסיסמה עודכנה'); } }, 'סיסמה'),
+        !self && h('button', { type: 'button', class: 'btn sm', onclick: () => call({ action: 'updateUser', user_id: u.user_id, role: u.role === 'admin' ? 'worker' : 'admin' }, 'התפקיד עודכן') }, u.role === 'admin' ? 'הפוך לעובד' : 'הפוך למנהל'),
+        !self && h('button', { type: 'button', class: 'btn sm ' + (u.active ? 'danger' : ''), onclick: () => { if (!u.active || confirm('להשבית את ' + u.name + '? הוא לא יוכל להיכנס, והעבודות שלו נשמרות.')) call({ action: 'updateUser', user_id: u.user_id, active: !u.active }, u.active ? 'המשתמש הושבת' : 'המשתמש הופעל'); } }, u.active ? 'השבת' : 'הפעל')));
+  };
+  addTo(body,
+    h('div', { class: 'card' }, h('h3', {}, 'משתמש חדש'),
+      h('p', { class: 'hint', style: 'margin-top:0' }, 'לכל עובד כניסה משלו. העבודות שהוא מדווח נרשמות על שמו אוטומטית. את האימייל והסיסמה מוסרים לו, והוא נכנס פעם אחת בטלפון.'),
+      h('label', { class: 'lbl' }, 'שם'), f.name, h('label', { class: 'lbl' }, 'אימייל לכניסה'), f.email,
+      h('label', { class: 'lbl' }, 'סיסמה'), f.pass, h('label', { class: 'lbl' }, 'תפקיד'), f.role, addBtn),
+    h('div', { class: 'card' }, h('h3', {}, 'משתמשים (' + users.length + ')'), users.map(row),
+      h('p', { class: 'hint' }, 'משתמש מושבת לא יכול להיכנס, אבל כל העבודות שלו נשמרות.')));
+}
 async function adminChanges(body) {
   const reps = await DB.all('reports');
   const rows = [];
@@ -1160,7 +1284,8 @@ async function adminSettings(body) {
   };
   const live = h('input', { type: 'checkbox', style: 'width:24px;height:24px' }); live.checked = local.get('liveTranscribe', '1') === '1';
   live.onchange = () => local.set('liveTranscribe', live.checked ? '1' : '0');
-  const key = h('input', { class: 'input', placeholder: 'sk-...', value: local.get('openaiKey', ''), autocomplete: 'off', dir: 'ltr' });
+  const ai = h('input', { type: 'checkbox', style: 'width:24px;height:24px' }); ai.checked = local.get('aiOff') !== '1';
+  ai.onchange = () => local.set('aiOff', ai.checked ? null : '1');
   const pin = h('input', { class: 'input', inputmode: 'numeric', placeholder: 'ללא קוד', value: (await DB.setting('adminPin')) || '' });
   const imp = h('input', { type: 'file', accept: 'application/json,.json', hidden: true });
   imp.onchange = async () => { const f = imp.files[0]; if (!f) return; try { await importBackup(f); toast('הגיבוי שוחזר ✓', 'ok'); route(); } catch (e) { alert('קובץ גיבוי לא תקין: ' + e.message); } };
@@ -1173,16 +1298,15 @@ async function adminSettings(body) {
   addTo(body,
     sb && h('div', { class: 'card' }, h('h3', {}, 'חשבון המוסך'),
       h('p', { class: 'hint', style: 'margin-top:0' }, 'הטלפון הזה מחובר כ-', h('b', { dir: 'ltr' }, who)),
-      h('button', { type: 'button', class: 'btn danger', onclick: async () => { if (!confirm('לנתק את הטלפון הזה מהמערכת? אפשר להיכנס שוב עם פרטי המוסך.')) return; await sb.auth.signOut(); route(); } }, 'התנתק מהטלפון הזה')),
+      h('button', { type: 'button', class: 'btn danger', onclick: async () => { if (!confirm('לנתק את הטלפון הזה מהמערכת? אפשר להיכנס שוב עם פרטי המוסך.')) return; await sb.auth.signOut(); me = null; route(); } }, 'התנתק מהטלפון הזה')),
     nLocal > 0 && moveLocalCard(nLocal),
     h('div', { class: 'card' }, h('h3', {}, 'הקלטה ותמלול'),
       h('label', { style: 'display:flex;gap:10px;align-items:center;font-weight:700' }, live, 'תמלול חי לעברית בזמן ההקלטה'),
       h('p', { class: 'hint' }, SRok ? 'הדפדפן הזה תומך בתמלול חי.' : 'הדפדפן הזה לא תומך בתמלול חי – ההקלטה עדיין נשמרת.'),
-      h('label', { class: 'lbl' }, 'תמלול מדויק בענן (לא חובה) – מפתח OpenAI'),
-      key, h('p', { class: 'hint' }, 'אם מוזן מפתח, הקלטות בלי תמלול יתומללו אוטומטית מהקובץ המקורי. המפתח נשמר רק בטלפון הזה.'),
-      h('button', { type: 'button', class: 'btn sm', onclick: () => { local.set('openaiKey', key.value.trim() || null); toast('נשמר', 'ok'); } }, 'שמור מפתח')),
+      sb && h('label', { style: 'display:flex;gap:10px;align-items:center;font-weight:700;margin-top:14px' }, ai, 'שיפור התמלול וזיהוי לוחית בענן (Gemini)'),
+      sb && h('p', { class: 'hint' }, 'אחרי כל הקלטה הטקסט משופר מההקלטה המקורית, ומספר הרישוי נקרא גם מתמונה של כל הרכב. ההגדרה חלה על הטלפון הזה.')),
     h('div', { class: 'card' }, h('h3', {}, 'תמונות בכפתורים במסך הראשי'), imgRow('truckImg', 'משאית'), imgRow('trailerImg', 'נגרר')),
-    h('div', { class: 'card' }, h('h3', {}, 'קוד למסך מנהל (לא חובה)'), pin,
+    !sb && h('div', { class: 'card' }, h('h3', {}, 'קוד למסך מנהל (לא חובה)'), pin,
       h('button', { type: 'button', class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await DB.setSetting('adminPin', pin.value.trim() || null); toast('נשמר', 'ok'); } }, 'שמור קוד')),
     h('div', { class: 'card' }, h('h3', {}, 'גיבוי ושחזור'),
       h('p', { class: 'hint', style: 'margin-top:0' }, sb ? 'הנתונים שמורים בענן. אפשר בנוסף להוריד עותק לקובץ.' : 'בגרסת הניסיון הנתונים נמצאים רק בטלפון הזה. מומלץ לגבות מדי פעם. ' + est),

@@ -1,0 +1,6 @@
+# local copies, not part of the site
+app.v1.js
+tarek-garage/
+*.zip
+.DS_Store
+supabase/.temp/
