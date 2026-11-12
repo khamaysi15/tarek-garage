@@ -1,0 +1,16 @@
+{
+  "name": "מוסך טארק ת.ד בע״מ",
+  "short_name": "מוסך טארק",
+  "description": "דיווח עבודות – משאיות ונגררים",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eef2f7",
+  "theme_color": "#0b2f5e",
+  "icons": [
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
