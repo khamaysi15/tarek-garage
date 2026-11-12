@@ -877,6 +877,7 @@ async function viewPick() {
 function PlateField(onChange, opts = {}) {
   const input = h('input', { class: 'input plate-in', inputmode: 'numeric', autocomplete: 'off', placeholder: 'הקלד מספר רכב', value: opts.value ? fmtPlate(opts.value) : '' });
   const file = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
+  const gallery = h('input', { type: 'file', accept: 'image/*', hidden: true });
   const status = h('div', { class: 'ocr-status', hidden: true });
   const preview = h('img', { class: 'plate-photo', hidden: true, alt: 'צילום לוחית' });
   const state = { image: null };
@@ -900,12 +901,14 @@ function PlateField(onChange, opts = {}) {
       status.className = 'ocr-status bad'; status.textContent = 'לא הצלחתי לקרוא את המספר. צלם שוב כך שהלוחית תיראה, או הקלד ידנית.';
     }
   }
-  file.onchange = async () => {
-    const f = file.files[0]; file.value = ''; if (!f) return;
+  for (const inp of [file, gallery]) inp.onchange = async () => {
+    const f = inp.files[0]; inp.value = ''; if (!f) return;
     recognize(await compressImage(f, 2000, 0.9));
   };
-  const el = h('div', {}, input, file,
-    h('button', { type: 'button', class: 'btn wide', style: 'margin-top:10px', onclick: () => file.click() }, ic('camera'), 'צלם את הרכב או את הלוחית'),
+  const el = h('div', {}, input, file, gallery,
+    h('div', { class: 'row', style: 'margin-top:10px' },
+      h('button', { type: 'button', class: 'btn', onclick: () => file.click() }, ic('camera'), 'צלם את הרכב או הלוחית'),
+      h('button', { type: 'button', class: 'btn', onclick: () => gallery.click() }, ic('image'), 'תמונה מהגלריה')),
     status, preview);
   return { el, input, state, recognize, value: () => normPlate(input.value) };
 }
