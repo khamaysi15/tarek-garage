@@ -118,6 +118,19 @@ let sb = null;
 let me = null;   // signed-in person's profile: { user_id, name, email, role: 'admin'|'worker', employee_id, active }
 const isAdmin = () => !sb || !!(me && me.role === 'admin');
 const myEid = () => (me ? me.employee_id || 'u-' + me.user_id : null);
+const actor = () => (me ? { byId: myEid(), byName: me.name } : {});   // the person actually signed in
+const workTime = x => x.workAt || x.at || x.createdAt;              // when the work was done (old records: when entered)
+const pad2 = n => String(n).padStart(2, '0');
+const toLocalInput = t => { const d = new Date(t); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); };
+function WorkDate(label = 'מתי בוצעה העבודה', value = Date.now(), disabled = false) {
+  const input = h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(value), max: toLocalInput(Date.now() + 864e5), disabled });
+  const el = h('div', {}, h('label', { class: 'lbl' }, label), input,
+    !disabled && h('div', { class: 'chips' },
+      h('button', { type: 'button', class: 'chip', onclick: () => { input.value = toLocalInput(Date.now()); } }, 'עכשיו'),
+      h('button', { type: 'button', class: 'chip', onclick: () => { input.value = toLocalInput(Date.now() - 864e5); } }, 'אתמול'),
+      h('button', { type: 'button', class: 'chip', onclick: () => { input.value = toLocalInput(Date.now() - 2 * 864e5); } }, 'לפני יומיים')));
+  return { el, input, get: () => { const t = new Date(input.value).getTime(); return isFinite(t) ? t : Date.now(); } };
+}
 const canEditDetails = r => isAdmin() || r.createdBy === myEid();
 const canEditEntry = e => isAdmin() || e.workerId === myEid();
 const USER_DOMAIN = '@users.invalid';   // usernames are stored as <name>@users.invalid – never shown, never mailed
@@ -618,12 +631,12 @@ async function waitTranscripts(comp, btn) {
   if (btn) fill(btn, h('span', { class: 'spin' }), ' מסיים תמלול…');
   for (let i = 0; i < 120 && comp.rec.busy(); i++) await sleep(250);
 }
-async function buildEntry(comp, worker, kind, at) {
+async function buildEntry(comp, worker, kind, at, workAt) {
   const recordings = [];
   for (const r of comp.rec.list) recordings.push({ id: uid(), blobId: await saveBlob(r.blob), mime: r.mime, duration: r.duration, transcript: (r.transcript || '').trim() });
   const photos = [];
   for (const p of comp.ph.list) photos.push(await saveBlob(p.blob));
-  return { id: uid(), at, kind, workerId: worker.id, workerName: worker.name, text: comp.text(), recordings, photos };
+  return { id: uid(), at, workAt: workAt || at, kind, workerId: worker.id, workerName: worker.name, ...actor(), text: comp.text(), recordings, photos };
 }
 
 async function WorkerPicker(label = 'שם העובד') {
@@ -657,8 +670,8 @@ function reportItem(r, onClick) {
   const allPh = r.entries.reduce((n, e) => n + e.photos.length, 0);
   const text = r.entries.map(e => e.text || e.recordings.map(x => x.transcript).join(' ')).filter(Boolean).join(' · ');
   return h('button', { class: 'item', type: 'button', onclick: onClick || (() => go('#/report/' + r.id)) },
-    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(r.createdAt))),
-    h('div', { class: 'meta' }, h('span', {}, r.customer || 'ללא שם לקוח'), h('span', {}, fmtTime(r.createdAt)), h('span', {}, first.workerName || '')),
+    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(workTime(r)))),
+    h('div', { class: 'meta' }, h('span', {}, r.customer || 'ללא שם לקוח'), h('span', {}, fmtTime(workTime(r))), h('span', {}, first.workerName || '')),
     text && h('div', { class: 'snip' }, text),
     h('div', { class: 'counts' },
       r.entries.length > 1 && h('span', {}, ic('plus'), (r.entries.length - 1) + ' תוספות'),
@@ -675,15 +688,19 @@ async function reportBody(r) {
     h('dl', { class: 'kv' },
       h('dt', {}, 'לקוח'), h('dd', {}, r.customer || '—'),
       r.type === 'truck' && [h('dt', {}, 'דגם'), h('dd', {}, r.model || '—'), h('dt', {}, 'קילומטרים'), h('dd', {}, r.km ? fmtNum(r.km) : '—')],
-      h('dt', {}, 'תאריך'), h('dd', {}, fmtDate(r.createdAt)),
-      h('dt', {}, 'שעה'), h('dd', {}, fmtTime(r.createdAt)),
+      h('dt', {}, 'תאריך העבודה'), h('dd', {}, fmtDT(workTime(r))),
+      Math.abs(workTime(r) - r.createdAt) > 30 * 60e3 && [h('dt', {}, 'נרשם במערכת'), h('dd', {}, fmtDT(r.createdAt))],
+      r.updatedAt && r.updatedAt - r.createdAt > 60e3 && [h('dt', {}, 'עדכון אחרון'), h('dd', {}, fmtDT(r.updatedAt))],
       h('dt', {}, 'נפתח ע״י'), h('dd', {}, r.createdByName || '—')),
     plateImg && h('div', { style: 'margin-top:12px' }, h('div', { class: 'sec-title', style: 'margin-top:0' }, 'צילום לוחית הרישוי'), photoGrid([plateImg]))));
   for (let i = 0; i < r.entries.length; i++) {
     const e = r.entries[i];
     const label = e.kind === 'note' ? 'הערה' : i === 0 ? 'העבודה שבוצעה' : 'עבודה נוספת';
     const card = h('div', { class: 'card entry' + (e.kind === 'note' ? ' note' : '') },
-      h('div', { class: 'entry-head' }, h('b', {}, label), h('span', { class: 'tag' }, ic('clock'), fmtDT(e.at)), h('span', { class: 'tag' }, ic('user'), e.workerName)));
+      h('div', { class: 'entry-head' }, h('b', {}, label),
+        h('span', { class: 'tag' }, ic('clock'), 'בוצע ' + fmtDT(workTime(e))),
+        h('span', { class: 'tag' }, ic('user'), e.workerName + byNote(e))),
+      Math.abs(workTime(e) - e.at) > 30 * 60e3 && h('p', { class: 'hint', style: 'margin:-4px 0 10px' }, 'נרשם במערכת: ' + fmtDT(e.at)));
     if (e.text) card.append(h('div', { class: 'sec-title', style: 'margin-top:0' }, 'טקסט שהוקלד'), h('div', { class: 'entry-text' }, e.text));
     if (e.versions && e.versions.length) card.append(versionsEl(e.versions));
     for (let j = 0; j < e.recordings.length; j++) {
@@ -708,9 +725,10 @@ function versionsEl(vs) {
   return h('details', { class: 'versions' }, h('summary', {}, 'נערך ' + vs.length + ' פעמים – הצג גרסאות קודמות'),
     vs.slice().reverse().map(v => h('div', { class: 'v' }, h('b', {}, 'לפני העריכה של ' + v.by + ' ב-' + fmtDT(v.at) + ':'), '\n', v.text || '(ריק)')));
 }
+const byNote = x => (x.byName && x.byName !== x.workerName ? ' (הוזן ע״י ' + x.byName + ')' : '');
 function logLine(l) {
   const what = l.action === 'create' ? 'יצר/ה את הדיווח' : l.action === 'add' ? (l.kind === 'note' ? 'הוסיף/ה הערה' : 'הוסיף/ה עבודה') : 'תיקן/ה את הדיווח';
-  return h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', l.workerName, ' · ', what,
+  return h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', l.workerName, byNote(l), ' · ', what,
     l.changes && l.changes.length ? h('div', { class: 'chg' }, l.changes.map(c => h('div', {}, c.field + ': "' + (c.from || '—') + '" ← "' + (c.to || '—') + '"'))) : null);
 }
 
@@ -970,11 +988,11 @@ async function viewNew(type, prePlate) {
     if (!customer.value && v.customer) customer.value = v.customer;
     if (isTruck && !model.value && v.model) model.value = v.model;
     if (isTruck && v.lastKm) { kmHint.hidden = false; kmHint.textContent = 'קילומטרים בטיפול הקודם: ' + fmtNum(v.lastKm); }
-    const reps = (await DB.byPlate(p)).sort((a, b) => b.createdAt - a.createdAt);
+    const reps = (await DB.byPlate(p)).sort((a, b) => workTime(b) - workTime(a));
     const today = reps.find(r => sameDay(r.createdAt, Date.now()));
     known.hidden = false;
     fill(known,
-      h('div', {}, h('b', {}, '✓ רכב מוכר במוסך'), ' – ', reps.length + ' טיפולים קודמים', reps[0] ? ' · אחרון: ' + fmtDate(reps[0].createdAt) : ''),
+      h('div', {}, h('b', {}, '✓ רכב מוכר במוסך'), ' – ', reps.length + ' טיפולים קודמים', reps[0] ? ' · אחרון: ' + fmtDate(workTime(reps[0])) : ''),
       v.type !== type ? h('div', { class: 'hint' }, 'שים לב: הרכב רשום אצלנו כ' + typeName(v.type) + '.') : null,
       h('div', { class: 'row' },
         h('button', { type: 'button', class: 'btn sm', onclick: () => showVehicleSheet(p) }, ic('clock'), 'טיפולים קודמים'),
@@ -982,9 +1000,9 @@ async function viewNew(type, prePlate) {
   }
   const comp = Composer(undefined, { onPhoto: b => { if (!plate.value()) plate.recognize(b, true); } });
   const worker = await WorkerPicker('שם העובד שביצע את העבודה');
-  const when = h('div', { class: 'when' }, ic('clock'));
-  const tick = () => { when.lastChild.nodeType === 3 && when.lastChild.remove(); when.append('התאריך והשעה יישמרו אוטומטית: ' + fmtDT(Date.now())); };
-  tick(); const iv = setInterval(tick, 20000);
+  const wd = WorkDate();
+  const when = h('div', { class: 'card' }, wd.el, h('p', { class: 'hint' }, 'אם העבודה נעשתה היום – אין צורך לשנות. זמן ההזנה למערכת נשמר בנפרד אוטומטית.'));
+  const iv = 0;
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור עבודה');
 
   const vcard = h('div', { class: 'card' },
@@ -1015,8 +1033,9 @@ async function viewNew(type, prePlate) {
         id: uid(), type, plate: p, customer: customer.value.trim(), model: isTruck ? model.value.trim() : '', km: isTruck ? kmVal : null,
         createdAt: now, updatedAt: now, createdBy: w.id, createdByName: w.name,
         plateImage: plate.state.image ? await saveBlob(plate.state.image) : null,
-        entries: [await buildEntry(comp, w, 'work', now)],
-        log: [{ at: now, workerId: w.id, workerName: w.name, action: 'create' }],
+        workAt: wd.get(),
+        entries: [await buildEntry(comp, w, 'work', now, wd.get())],
+        log: [{ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'create' }],
       };
       await DB.put('reports', r); await upsertVehicle(r);
       dirtyCheck = null; toast('העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
@@ -1028,7 +1047,7 @@ async function viewNew(type, prePlate) {
 }
 
 async function showVehicleSheet(plate) {
-  const reps = (await DB.byPlate(plate)).sort((a, b) => b.createdAt - a.createdAt);
+  const reps = (await DB.byPlate(plate)).sort((a, b) => workTime(b) - workTime(a));
   const s = openSheet('טיפולים קודמים – ' + fmtPlate(plate), h('div'));
   const list = () => fill(s.body, ...reps.map(r => reportItem(r, async () => {
     fill(s.body, h('button', { class: 'btn sm', type: 'button', style: 'margin-bottom:12px', onclick: list }, 'חזרה לרשימה'), await reportBody(r));
@@ -1069,7 +1088,7 @@ async function viewHistory(q0) {
 
 async function viewVehicle(p) {
   const v = await DB.get('vehicles', p);
-  const reps = (await DB.byPlate(p)).sort((a, b) => b.createdAt - a.createdAt);
+  const reps = (await DB.byPlate(p)).sort((a, b) => workTime(b) - workTime(a));
   setHeader('history', 'היסטוריה – ' + fmtPlate(p), '#/history');
   if (!v && !reps.length) { fill(view, h('div', { class: 'empty' }, 'הרכב לא נמצא')); return; }
   const type = (v && v.type) || reps[0].type;
@@ -1113,13 +1132,14 @@ async function viewAdd(id) {
   const renderKinds = () => fill(kinds, ...[['work', 'עבודה נוספת'], ['note', 'הערה']].map(([k, l]) => h('button', { type: 'button', class: 'chip' + (kind === k ? ' on' : ''), onclick: () => { kind = k; renderKinds(); } }, l)));
   renderKinds();
   const comp = Composer('מה נוסף');
-  const worker = await WorkerPicker('מי מוסיף');
+  const worker = await WorkerPicker('מי ביצע את העבודה');
+  const wd = WorkDate();
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תוספת');
   fill(view,
     h('div', { class: 'card' }, h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', {}, r.customer || '')),
       h('p', { class: 'hint' }, 'הדיווח נפתח ב-' + fmtDT(r.createdAt) + '. מה שנרשם קודם נשאר כמו שהוא – התוספת תישמר בנפרד עם השם והשעה.'),
       h('label', { class: 'lbl', style: 'margin-top:12px' }, 'סוג התוספת'), kinds),
-    comp.el, worker.el, saveBtn);
+    comp.el, worker.el, h('div', { class: 'card' }, wd.el), saveBtn);
   dirtyCheck = () => comp.dirty(); cleanup = () => comp.cleanup();
   saveBtn.onclick = async () => {
     if (comp.rec.isRecording()) { alert('יש הקלטה פעילה – לחץ קודם "סיים הקלטה".'); return; }
@@ -1129,10 +1149,10 @@ async function viewAdd(id) {
     saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
     try {
       const now = Date.now();
-      const entry = await buildEntry(comp, w, kind, now);
+      const entry = await buildEntry(comp, w, kind, now, wd.get());
       const fresh = await DB.get('reports', id);
       fresh.entries.push(entry);
-      fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'add', kind });
+      fresh.log.push({ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'add', kind });
       fresh.updatedAt = now; await DB.put('reports', fresh); await upsertVehicle(fresh);
       dirtyCheck = null; toast('התוספת נשמרה ✓', 'ok'); go('#/report/' + id);
     } catch (e) {
@@ -1158,11 +1178,13 @@ async function viewEdit(id) {
   const entryFields = r.entries.map((e, i) => {
     const ok = canEditEntry(e);
     const ta = h('textarea', { class: 'input', rows: 3, value: e.text || '', disabled: !ok });
-    return { e, ok, ta,
+    const wd = WorkDate('מתי בוצעה העבודה', workTime(e), !ok);
+    return { e, ok, ta, wd,
       recs: e.recordings.map(rc => ({ rc, ta: h('textarea', { class: 'input', rows: 2, value: rc.transcript || '', disabled: !ok }) })),
       label: e.kind === 'note' ? 'הערה' : i === 0 ? 'העבודה שבוצעה' : 'עבודה נוספת ' + i };
   });
-  const worker = await WorkerPicker('מי מתקן');
+  // with logins the person fixing is whoever is signed in; without cloud, pick a name
+  const worker = sb && me ? { el: null, get: () => ({ id: myEid(), name: me.name }) } : await WorkerPicker('מי מתקן');
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תיקון');
   fill(view,
     h('div', { class: 'demo-pill' }, ic('edit'), h('span', {}, 'כל תיקון נרשם בהיסטוריית השינויים עם שם המתקן והשעה, והנוסח הקודם נשמר.')),
@@ -1174,6 +1196,7 @@ async function viewEdit(id) {
     entryFields.map((x, i) => {
       const card = h('div', { class: 'card', style: x.ok ? '' : 'opacity:.6' }, h('h3', {}, x.label + ' · ' + fmtDT(x.e.at) + ' · ' + x.e.workerName),
         h('label', { class: 'lbl' }, 'טקסט'), x.ta,
+        x.wd.el,
         x.recs.map((y, j) => [h('label', { class: 'lbl' }, 'תמלול הקלטה ' + (j + 1)), y.ta]),
         isAdmin() && sb && r.entries.length > 1 && h('button', { type: 'button', class: 'btn sm danger', style: 'margin-top:12px', onclick: () => {
           if (deleted.has(i)) { deleted.delete(i); card.style.outline = ''; return; }
@@ -1185,7 +1208,7 @@ async function viewEdit(id) {
     worker.el, saveBtn);
   const dirty = () => normPlate(f.plate.value) !== r.plate || f.customer.value.trim() !== (r.customer || '') ||
     (isTruck && (f.model.value.trim() !== (r.model || '') || (+normPlate(f.km.value) || null) !== (r.km || null))) ||
-    entryFields.some(x => x.ta.value.trim() !== (x.e.text || '') || x.recs.some(y => y.ta.value.trim() !== (y.rc.transcript || ''))) || deleted.size > 0;
+    entryFields.some(x => x.ta.value.trim() !== (x.e.text || '') || Math.abs(x.wd.get() - workTime(x.e)) >= 60e3 || x.recs.some(y => y.ta.value.trim() !== (y.rc.transcript || ''))) || deleted.size > 0;
   dirtyCheck = dirty;
   saveBtn.onclick = async () => {
     if (!dirty()) { toast('לא בוצעו שינויים'); return; }
@@ -1202,6 +1225,12 @@ async function viewEdit(id) {
     entryFields.forEach((x, i) => {
       if (!x.ok) return;
       const e = fresh.entries.find(z => z.id === x.e.id); if (!e) return; const nv = x.ta.value.trim();
+      const nw = x.wd.get();
+      if (Math.abs(nw - workTime(e)) >= 60e3) {
+        changes.push({ field: 'תאריך העבודה – ' + x.label, from: fmtDT(workTime(e)), to: fmtDT(nw) });
+        e.workAt = nw;
+        if (i === 0 && headOk) fresh.workAt = nw;
+      }
       if (nv !== (e.text || '')) { (e.versions = e.versions || []).push({ text: e.text || '', at: now, by: w.name }); changes.push({ field: 'טקסט – ' + x.label, from: e.text, to: nv }); e.text = nv; }
       x.recs.forEach((y, j) => { const rc = e.recordings[j]; const tv = y.ta.value.trim();
         if (tv !== (rc.transcript || '')) { (rc.versions = rc.versions || []).push({ text: rc.transcript || '', at: now, by: w.name }); changes.push({ field: 'תמלול הקלטה ' + (j + 1) + ' – ' + x.label, from: rc.transcript, to: tv }); rc.transcript = tv; } });
@@ -1212,7 +1241,7 @@ async function viewEdit(id) {
       fresh.entries = fresh.entries.filter(e => { if (ids.has(e.id)) { gone.push(e); return false; } return true; });
       gone.forEach(e => changes.push({ field: 'נמחק קטע של ' + e.workerName + ' מ-' + fmtDT(e.at), from: e.text || e.recordings.map(x => x.transcript).join(' '), to: '' }));
     }
-    fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'edit', changes });
+    fresh.log.push({ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'edit', changes });
     fresh.updatedAt = now;
     try { await DB.put('reports', fresh); await upsertVehicle(fresh); } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); return; }
     for (const e of gone) for (const b of [...e.photos, ...e.recordings.map(x => x.blobId)]) { try { await Blobs.del(b); } catch { } }
@@ -1256,7 +1285,7 @@ async function adminWorks(body) {
     const from = f.from.value ? new Date(f.from.value + 'T00:00').getTime() : 0;
     const to = f.to.value ? new Date(f.to.value + 'T23:59:59').getTime() : Infinity;
     const res = reps.filter(r => (!pd || r.plate.includes(pd)) && (!c || (r.customer || '').includes(c)) && (!t || r.type === t) &&
-      (!w || r.entries.some(e => e.workerId === w)) && r.entries.some(e => e.at >= from && e.at <= to));
+      (!w || r.entries.some(e => e.workerId === w)) && r.entries.some(e => workTime(e) >= from && workTime(e) <= to));
     fill(out, h('h3', { style: 'margin:6px 2px 10px' }, 'נמצאו ' + res.length + ' עבודות'), res.length ? res.map(r => reportItem(r)) : h('div', { class: 'empty' }, 'אין תוצאות'));
   };
   Object.values(f).forEach(x => x.addEventListener('input', run));
