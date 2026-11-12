@@ -128,7 +128,13 @@ Deno.serve(async (req) => {
         return json({ users: data });
       }
       case 'createUser': {
-        const email = String(body.email || '').trim().toLowerCase();
+        // a plain username (e.g. "khaled") becomes an internal address nobody sees; a real email also works
+        const login = String(body.login || body.email || '').trim().toLowerCase();
+        let email = login;
+        if (!login.includes('@')) {
+          if (!/^[a-z0-9][a-z0-9._-]{1,29}$/.test(login)) return json({ error: 'bad_username' }, 400);
+          email = login + '@users.invalid';
+        }
         const name = String(body.name || '').trim();
         const role = body.role === 'admin' ? 'admin' : 'worker';
         if (!email || !name || String(body.password || '').length < 6) return json({ error: 'bad_input' }, 400);

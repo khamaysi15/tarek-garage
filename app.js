@@ -108,6 +108,9 @@ const CLOUD = { url: 'https://yopertfgqpdxxufdaomr.supabase.co', key: 'sb_publis
 let sb = null;
 let me = null;   // signed-in person's profile: { user_id, name, email, role: 'admin'|'worker', employee_id, active }
 const isAdmin = () => !sb || !!(me && me.role === 'admin');
+const USER_DOMAIN = '@users.invalid';   // usernames are stored as <name>@users.invalid – never shown, never mailed
+const loginToEmail = v => { v = String(v || '').trim().toLowerCase(); return v.includes('@') ? v : v + USER_DOMAIN; };
+const showLogin = e => String(e || '').replace(USER_DOMAIN, '');
 async function loadMe() {
   const { data: { session } } = await sb.auth.getSession(); if (!session) return null;
   const { data, error } = await sb.from('profiles').select('*').eq('user_id', session.user.id).maybeSingle();
@@ -748,20 +751,20 @@ function viewNoAccess() {
 async function viewLogin() {
   setHeader('', 'כניסה למערכת המוסך');
   document.body.classList.add('locked');
-  const email = h('input', { class: 'input', type: 'email', autocomplete: 'username', dir: 'ltr', placeholder: 'email' });
+  const email = h('input', { class: 'input', type: 'text', autocomplete: 'username', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', dir: 'ltr', placeholder: 'username' });
   const pass = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', dir: 'ltr', placeholder: 'password' });
   const msg = h('p', { class: 'hint', hidden: true, style: 'color:var(--danger);font-weight:700' });
   const btn = h('button', { type: 'submit', class: 'btn big primary' }, 'כניסה');
   const form = h('form', { class: 'card' },
     h('h3', {}, 'כניסה עם פרטי המוסך'),
-    h('p', { class: 'hint', style: 'margin-top:0' }, 'נכנסים פעם אחת בכל טלפון, והטלפון נשאר מחובר. את הפרטים מקבלים מטארק.'),
-    h('label', { class: 'lbl' }, 'אימייל המוסך'), email,
+    h('p', { class: 'hint', style: 'margin-top:0' }, 'נכנסים פעם אחת בכל טלפון, והטלפון נשאר מחובר. את שם המשתמש והסיסמה מקבלים מהמנהל. (אפשר להיכנס גם עם אימייל.)'),
+    h('label', { class: 'lbl' }, 'שם משתמש'), email,
     h('label', { class: 'lbl' }, 'סיסמה'), pass, msg, h('div', { style: 'margin-top:16px' }, btn));
   form.addEventListener('submit', async e => {
     e.preventDefault(); msg.hidden = true; btn.disabled = true; fill(btn, h('span', { class: 'spin' }), ' נכנס…');
-    const { error } = await sb.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
+    const { error } = await sb.auth.signInWithPassword({ email: loginToEmail(email.value), password: pass.value });
     btn.disabled = false; fill(btn, 'כניסה');
-    if (error) { msg.hidden = false; msg.textContent = /invalid/i.test(error.message) ? 'אימייל או סיסמה לא נכונים.' : niceErr(error); return; }
+    if (error) { msg.hidden = false; msg.textContent = /invalid/i.test(error.message) ? 'שם משתמש או סיסמה לא נכונים.' : niceErr(error); return; }
     me = null; toast('נכנסת בהצלחה ✓', 'ok'); route();
   });
   fill(view, form);
@@ -1224,12 +1227,13 @@ async function adminWorkers(body) {
       h('p', { class: 'hint' }, 'עובד מושבת לא מופיע ברשימת הבחירה, אבל העבודות שלו נשמרות.')));
 }
 const USER_ERR = {
-  bad_input: 'מלא שם, אימייל וסיסמה (לפחות 6 תווים).',
+  bad_input: 'מלא שם, שם משתמש וסיסמה (לפחות 6 תווים).',
+  bad_username: 'שם משתמש: אותיות באנגלית ומספרים בלבד (אפשר גם . _ -), בלי רווחים. למשל khaled או ahmad2.',
   bad_password: 'הסיסמה צריכה להיות לפחות 6 תווים.',
   cannot_lock_yourself_out: 'אי אפשר להשבית את עצמך או להוריד את עצמך מניהול.',
   admins_only: 'רק מנהל יכול לנהל משתמשים.',
 };
-const userErr = e => { const m = String(e && e.message || e); return USER_ERR[m] || (/already been registered|already exists/i.test(m) ? 'כבר קיים משתמש עם האימייל הזה.' : niceErr(e)); };
+const userErr = e => { const m = String(e && e.message || e); return USER_ERR[m] || (/already been registered|already exists/i.test(m) ? 'כבר קיים משתמש עם שם המשתמש הזה.' : niceErr(e)); };
 async function adminUsers(body) {
   let users;
   try { users = (await garageCall({ action: 'listUsers' })).users || []; }
@@ -1237,14 +1241,15 @@ async function adminUsers(body) {
   const call = async (payload, okMsg) => { try { await garageCall(payload); toast(okMsg, 'ok'); me = null; route(); } catch (e) { alert(userErr(e)); } };
   const f = {
     name: h('input', { class: 'input', placeholder: 'שם מלא (יופיע על העבודות)', autocomplete: 'off' }),
-    email: h('input', { class: 'input', type: 'email', dir: 'ltr', placeholder: 'email', autocomplete: 'off' }),
+    email: h('input', { class: 'input', type: 'text', dir: 'ltr', placeholder: 'למשל: khaled', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false' }),
     pass: h('input', { class: 'input', type: 'text', dir: 'ltr', placeholder: 'סיסמה – לפחות 6 תווים', autocomplete: 'new-password' }),
     role: h('select', { class: 'input' }, h('option', { value: 'worker' }, 'עובד – מדווח עבודות'), h('option', { value: 'admin' }, 'מנהל – גם מסך מנהל וניהול משתמשים')),
   };
   const addBtn = h('button', { type: 'button', class: 'btn primary wide', style: 'margin-top:12px' }, ic('plus'), 'צור משתמש');
   addBtn.onclick = async () => {
     addBtn.disabled = true;
-    await call({ action: 'createUser', name: f.name.value.trim(), email: f.email.value.trim(), password: f.pass.value, role: f.role.value }, 'המשתמש נוצר ✓');
+    const login = f.email.value.trim().toLowerCase();
+    await call({ action: 'createUser', name: f.name.value.trim(), login, password: f.pass.value, role: f.role.value }, 'המשתמש נוצר ✓ – שם משתמש: ' + login);
     addBtn.disabled = false;
   };
   const row = u => {
@@ -1252,7 +1257,7 @@ async function adminUsers(body) {
     return h('div', { class: 'emp' + (u.active ? '' : ' off') },
       h('div', { class: 'grow' },
         h('div', { class: 'name', style: 'font-weight:700' }, u.name || '—', self ? ' (אתה)' : ''),
-        h('div', { class: 'hint', style: 'margin:0', dir: 'ltr' }, u.email || ''),
+        h('div', { class: 'hint', style: 'margin:0' }, 'כניסה: ', h('b', { dir: 'ltr' }, showLogin(u.email))),
         h('div', { class: 'hint', style: 'margin:0' }, (u.role === 'admin' ? 'מנהל' : 'עובד') + (u.active ? '' : ' · מושבת'))),
       h('div', { class: 'row', style: 'gap:6px;justify-content:flex-end' },
         h('button', { type: 'button', class: 'btn sm', onclick: () => { const n = (prompt('שם חדש:', u.name) || '').trim(); if (n && n !== u.name) call({ action: 'updateUser', user_id: u.user_id, name: n }, 'השם עודכן'); } }, 'שם'),
@@ -1262,8 +1267,10 @@ async function adminUsers(body) {
   };
   addTo(body,
     h('div', { class: 'card' }, h('h3', {}, 'משתמש חדש'),
-      h('p', { class: 'hint', style: 'margin-top:0' }, 'לכל עובד כניסה משלו. העבודות שהוא מדווח נרשמות על שמו אוטומטית. את האימייל והסיסמה מוסרים לו, והוא נכנס פעם אחת בטלפון.'),
-      h('label', { class: 'lbl' }, 'שם'), f.name, h('label', { class: 'lbl' }, 'אימייל לכניסה'), f.email,
+      h('p', { class: 'hint', style: 'margin-top:0' }, 'לכל עובד כניסה משלו. העבודות שהוא מדווח נרשמות על שמו אוטומטית. את שם המשתמש והסיסמה מוסרים לו, והוא נכנס פעם אחת בטלפון.'),
+      h('label', { class: 'lbl' }, 'שם (יופיע על העבודות)'), f.name,
+      h('label', { class: 'lbl' }, 'שם משתמש לכניסה'), f.email,
+      h('p', { class: 'hint', style: 'margin:4px 0 0' }, 'אותיות באנגלית ומספרים, בלי רווחים. אפשר גם אימייל.'),
       h('label', { class: 'lbl' }, 'סיסמה'), f.pass, h('label', { class: 'lbl' }, 'תפקיד'), f.role, addBtn),
     h('div', { class: 'card' }, h('h3', {}, 'משתמשים (' + users.length + ')'), users.map(row),
       h('p', { class: 'hint' }, 'משתמש מושבת לא יכול להיכנס, אבל כל העבודות שלו נשמרות.')));
@@ -1308,7 +1315,7 @@ async function adminSettings(body) {
   const nLocal = await localJobsCount();
   addTo(body,
     sb && h('div', { class: 'card' }, h('h3', {}, 'חשבון המוסך'),
-      h('p', { class: 'hint', style: 'margin-top:0' }, 'הטלפון הזה מחובר כ-', h('b', { dir: 'ltr' }, who)),
+      h('p', { class: 'hint', style: 'margin-top:0' }, 'הטלפון הזה מחובר כ-', h('b', { dir: 'ltr' }, showLogin(who))),
       h('button', { type: 'button', class: 'btn danger', onclick: async () => { if (!confirm('לנתק את הטלפון הזה מהמערכת? אפשר להיכנס שוב עם פרטי המוסך.')) return; await sb.auth.signOut(); me = null; route(); } }, 'התנתק מהטלפון הזה')),
     nLocal > 0 && moveLocalCard(nLocal),
     h('div', { class: 'card' }, h('h3', {}, 'הקלטה ותמלול'),
