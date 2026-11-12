@@ -1327,6 +1327,20 @@ async function adminUsers(body) {
       h('label', { class: 'lbl' }, 'סיסמה'), f.pass, h('label', { class: 'lbl' }, 'תפקיד'), f.role, addBtn),
     h('div', { class: 'card' }, h('h3', {}, 'משתמשים (' + users.length + ')'), users.map(row),
       h('p', { class: 'hint' }, 'משתמש מושבת לא יכול להיכנס, אבל כל העבודות שלו נשמרות.')));
+  // names in the worker list that have no login (added in the first version, or by hand)
+  const loose = (await employees(true)).filter(e => !e.userId && !users.some(u => u.employee_id === e.id));
+  if (loose.length) addTo(body, h('div', { class: 'card' }, h('h3', {}, 'שמות עובדים בלי כניסה (' + loose.length + ')'),
+    h('p', { class: 'hint', style: 'margin-top:0' }, 'שמות שנוספו לרשימה בלי שם משתמש. מחיקה מוציאה את השם מהרשימה – העבודות שכבר נרשמו נשארות עם השם.'),
+    loose.map(e => h('div', { class: 'emp' },
+      h('div', { class: 'grow' }, h('div', { class: 'name', style: 'font-weight:700' }, e.name)),
+      h('button', { type: 'button', class: 'btn sm', onclick: async () => {
+        const n = (prompt('שם חדש:', e.name) || '').trim(); if (!n || n === e.name) return;
+        try { await DB.put('employees', { ...e, name: n }); toast('השם עודכן', 'ok'); route(); } catch (err) { alert(niceErr(err)); }
+      } }, 'שנה שם'),
+      h('button', { type: 'button', class: 'btn sm danger', onclick: async () => {
+        if (!confirm('למחוק את השם "' + e.name + '" מרשימת העובדים? העבודות שלו נשארות.')) return;
+        try { await DB.del('employees', e.id); toast('השם נמחק', 'ok'); route(); } catch (err) { alert(niceErr(err)); }
+      } }, ic('trash'), 'מחק')))));
 }
 async function adminChanges(body) {
   const reps = await DB.all('reports');
