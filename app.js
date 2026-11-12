@@ -1269,6 +1269,136 @@ async function viewAdmin(tab) {
   if (tab === 'settings') return adminSettings(body);
   return adminWorks(body);
 }
+/* ---------- admin export: ZIP with Excel + photos + recordings + offline page ---------- */
+function exportCard() {
+  const d = new Date();
+  const from = h('input', { class: 'input', type: 'date', value: d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-01' });
+  const to = h('input', { class: 'input', type: 'date', value: d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) });
+  const status = h('p', { class: 'hint', hidden: true });
+  const btn = h('button', { type: 'button', class: 'btn primary wide', style: 'margin-top:12px' }, ic('down'), 'הורד הכול לקובץ');
+  btn.onclick = async () => {
+    if (!from.value || !to.value) { alert('בחר מתאריך ועד תאריך.'); return; }
+    btn.disabled = true; status.hidden = false;
+    try { await exportRange(new Date(from.value + 'T00:00').getTime(), new Date(to.value + 'T23:59:59').getTime(), from.value, to.value, status); }
+    catch (e) { console.error(e); fill(status, 'ההורדה נכשלה: ' + niceErr(e)); }
+    btn.disabled = false;
+  };
+  return h('div', { class: 'card', style: 'border:2px solid var(--brand2)' },
+    h('h3', {}, 'הורדת עבודות למחשב'),
+    h('p', { class: 'hint', style: 'margin-top:0' }, 'קובץ ZIP אחד: טבלת Excel של כל העבודות, תיקייה לכל דיווח עם התמונות וההקלטות, ודף "פתח-אותי" לצפייה בהכול גם בלי אינטרנט.'),
+    h('div', { class: 'grid2' }, h('div', {}, h('label', { class: 'lbl' }, 'מתאריך'), from), h('div', {}, h('label', { class: 'lbl' }, 'עד תאריך'), to)),
+    btn, status);
+}
+const extOf = t => (/jpe?g/.test(t) ? 'jpg' : /png/.test(t) ? 'png' : /heic/.test(t) ? 'heic' : /mp4|m4a|aac/.test(t) ? 'm4a' : /wav/.test(t) ? 'wav' : /webm/.test(t) ? 'webm' : /ogg/.test(t) ? 'ogg' : /mpeg|mp3/.test(t) ? 'mp3' : 'bin');
+const ymd = t => { const d = new Date(t); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); };
+const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+async function exportRange(from, to, fromTxt, toTxt, status) {
+  const say = t => fill(status, h('span', { class: 'spin' }), ' ' + t);
+  say('טוען נתונים…');
+  if (!window.JSZip) await loadScript('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js');
+  if (!window.XLSX) await loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
+  const reports = (await DB.all('reports'))
+    .map(r => ({ r, entries: r.entries.filter(e => workTime(e) >= from && workTime(e) <= to) }))
+    .filter(x => x.entries.length)
+    .sort((a, b) => workTime(a.entries[0]) - workTime(b.entries[0]));
+  if (!reports.length) { fill(status, 'אין עבודות בין התאריכים האלה.'); return; }
+  const files = [];   // { path, id }
+  const rows = [], viewer = [];
+  for (const { r, entries } of reports) {
+    const folder = 'jobs/' + ymd(workTime(entries[0])) + '_' + r.plate + '_' + r.id.slice(0, 6) + '/';
+    const vjob = { plate: fmtPlate(r.plate), type: typeName(r.type), customer: r.customer || '', model: r.model || '', km: r.km || '', folder, entries: [], platePhoto: null };
+    if (r.plateImage) { vjob.platePhoto = folder + 'plate.jpg'; files.push({ path: vjob.platePhoto, id: r.plateImage }); }
+    entries.forEach((e, n) => {
+      const i = r.entries.indexOf(e);
+      const kind = e.kind === 'note' ? 'הערה' : i === 0 ? 'עבודה' : 'עבודה נוספת';
+      const tag = 'part' + (i + 1);
+      const photos = e.photos.map((id, k) => { const path = folder + tag + '-photo-' + (k + 1) + '.jpg'; files.push({ path, id }); return path; });
+      const recs = e.recordings.map((rc, k) => { const path = folder + tag + '-recording-' + (k + 1) + '.' + extOf(rc.mime || ''); files.push({ path, id: rc.blobId }); return { path, transcript: rc.transcript || '' }; });
+      rows.push({
+        'תאריך העבודה': ymd(workTime(e)), 'שעה': fmtTime(workTime(e)), 'נרשם במערכת': fmtDT(e.at),
+        'מספר רישוי': fmtPlate(r.plate), 'סוג': typeName(r.type), 'לקוח': r.customer || '', 'דגם': r.model || '', 'ק״מ': r.km || '',
+        'עובד': e.workerName || '', 'הוזן ע״י': e.byName && e.byName !== e.workerName ? e.byName : '', 'סוג קטע': kind,
+        'מה בוצע (טקסט)': e.text || '', 'תמלול הקלטות': recs.map(x => x.transcript).filter(Boolean).join(' | '),
+        'תמונות': photos.length, 'הקלטות': recs.length, 'תיקייה': folder,
+      });
+      vjob.entries.push({ kind, date: fmtDT(workTime(e)), entered: fmtDT(e.at), worker: e.workerName || '', by: e.byName && e.byName !== e.workerName ? e.byName : '', text: e.text || '', photos, recs });
+    });
+    viewer.push(vjob);
+  }
+  if (files.length > 400 && !confirm('יש ' + files.length + ' קבצים (תמונות והקלטות). ההורדה עלולה לקחת כמה דקות. להמשיך?')) { fill(status, 'בוטל.'); return; }
+  const zip = new JSZip();
+  // photos and recordings (already compressed → stored as-is)
+  let done = 0, missing = 0;
+  const queue = files.slice();
+  async function worker() {
+    while (queue.length) {
+      const f = queue.shift();
+      try { const b = await Blobs.get(f.id); if (b) zip.file(f.path, b, { binary: true, compression: 'STORE' }); else missing++; } catch { missing++; }
+      say('מוריד תמונות והקלטות ' + (++done) + ' / ' + files.length + '…');
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  // Excel
+  say('בונה קובץ Excel…');
+  const wb = XLSX.utils.book_new();
+  wb.Workbook = { Views: [{ RTL: true }] };
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [12, 7, 16, 12, 8, 18, 12, 9, 14, 14, 11, 50, 50, 7, 7, 34].map(w => ({ wch: w }));
+  rows.forEach((row, i) => { const c = XLSX.utils.encode_cell({ r: i + 1, c: 15 }); if (ws[c]) ws[c].l = { Target: row['תיקייה'], Tooltip: 'פתח תיקייה' }; });
+  XLSX.utils.book_append_sheet(wb, ws, 'עבודות');
+  const plates = [...new Set(reports.map(x => x.r.plate))];
+  const vehicles = (await DB.all('vehicles')).filter(v => plates.includes(v.plate)).map(v => ({
+    'מספר רישוי': fmtPlate(v.plate), 'סוג': typeName(v.type), 'לקוח': v.customer || '', 'דגם': v.model || '', 'ק״מ אחרון': v.lastKm || '',
+    'עבודות בתקופה': reports.filter(x => x.r.plate === v.plate).reduce((n, x) => n + x.entries.length, 0) }));
+  const wv = XLSX.utils.json_to_sheet(vehicles); wv['!cols'] = [12, 8, 22, 14, 10, 12].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, wv, 'רכבים');
+  const changes = [];
+  for (const { r } of reports) for (const l of r.log || []) if (l.at >= from && l.at <= to) changes.push({
+    'מתי': fmtDT(l.at), 'מספר רישוי': fmtPlate(r.plate), 'מי': l.workerName || '', 'הוזן ע״י': l.byName && l.byName !== l.workerName ? l.byName : '',
+    'פעולה': l.action === 'create' ? 'פתח דיווח' : l.action === 'add' ? 'הוסיף' : 'תיקן',
+    'פרטים': (l.changes || []).map(c => c.field + ': "' + (c.from || '') + '" ← "' + (c.to || '') + '"').join(' | ') });
+  const wc = XLSX.utils.json_to_sheet(changes.length ? changes : [{ 'מתי': '', 'פרטים': 'אין שינויים בתקופה' }]); wc['!cols'] = [16, 12, 14, 14, 10, 80].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, wc, 'שינויים');
+  zip.file('עבודות.xlsx', XLSX.write(wb, { bookType: 'xlsx', type: 'array' }));
+  // offline viewer page
+  zip.file('פתח-אותי.html', offlinePage(viewer, fromTxt, toTxt));
+  say('אורז קובץ ZIP…');
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } }, m => say('אורז ' + Math.round(m.percent) + '%…'));
+  const name = 'מוסך-טארק_' + fromTxt + '_עד_' + toTxt + '.zip';
+  const file = new File([blob], name, { type: 'application/zip' });
+  fill(status, '✓ מוכן: ' + rows.length + ' עבודות, ' + (files.length - missing) + ' קבצים' + (missing ? ' (' + missing + ' קבצים לא נמצאו)' : '') + ' · ' + (blob.size / 1048576).toFixed(1) + ' MB');
+  const a = h('a', { href: URL.createObjectURL(file), download: name }); document.body.append(a); a.click(); a.remove();
+  if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); } catch { }
+  }
+}
+function offlinePage(jobs, fromTxt, toTxt) {
+  const card = j => `<section class="job" data-s="${esc((j.plate + ' ' + j.customer + ' ' + j.model + ' ' + j.entries.map(e => e.worker + ' ' + e.text + ' ' + e.recs.map(r => r.transcript).join(' ')).join(' ')).toLowerCase())}">
+  <h2><span class="plate">${esc(j.plate)}</span> ${esc(j.type)} · ${esc(j.customer || 'ללא שם לקוח')}${j.model ? ' · ' + esc(j.model) : ''}${j.km ? ' · ' + esc(j.km) + ' ק״מ' : ''}</h2>
+  ${j.platePhoto ? `<a href="${esc(j.platePhoto)}"><img class="pp" src="${esc(j.platePhoto)}" alt=""></a>` : ''}
+  ${j.entries.map(e => `<div class="e"><b>${esc(e.kind)}</b> · בוצע ${esc(e.date)} · ${esc(e.worker)}${e.by ? ' (הוזן ע״י ' + esc(e.by) + ')' : ''} <span class="m">נרשם ${esc(e.entered)}</span>
+    ${e.text ? `<p>${esc(e.text)}</p>` : ''}
+    ${e.recs.map((r, i) => `<div class="r"><audio controls preload="none" src="${esc(r.path)}"></audio> <a href="${esc(r.path)}">הקלטה ${i + 1}</a>${r.transcript ? `<p>${esc(r.transcript)}</p>` : ''}</div>`).join('')}
+    ${e.photos.length ? `<div class="ph">${e.photos.map(p => `<a href="${esc(p)}" target="_blank"><img src="${esc(p)}" loading="lazy" alt=""></a>`).join('')}</div>` : ''}
+  </div>`).join('')}
+  <div class="m">תיקייה: ${esc(j.folder)}</div></section>`;
+  return `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>מוסך טארק – עבודות ${esc(fromTxt)} עד ${esc(toTxt)}</title><style>
+body{font-family:-apple-system,"Segoe UI",Arial,sans-serif;background:#eef2f7;color:#0f1b2d;margin:0;padding:16px;max-width:900px;margin:auto}
+h1{font-size:22px;margin:4px 0}.top{position:sticky;top:0;background:#eef2f7;padding:8px 0}
+input{width:100%;font-size:17px;padding:10px;border:2px solid #cfd8e3;border-radius:10px;box-sizing:border-box}
+.job{background:#fff;border-radius:14px;padding:14px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+h2{font-size:18px;margin:0 0 8px}.plate{background:#ffcd00;border:2px solid #111;border-radius:5px;padding:1px 8px;direction:ltr;display:inline-block;font-weight:800}
+.e{border-right:4px solid #14529e;padding:6px 10px;margin:10px 0}.m{color:#5b6b80;font-size:13px}
+p{white-space:pre-wrap;margin:6px 0}.r{background:#f4f7fb;border-radius:8px;padding:6px 8px;margin:6px 0}audio{width:100%;max-width:420px}
+.ph{display:flex;flex-wrap:wrap;gap:6px}.ph img{width:120px;height:120px;object-fit:cover;border-radius:8px}.pp{height:70px;border-radius:6px}
+</style></head><body><div class="top"><h1>מוסך טארק ת.ד בע״מ – עבודות ${esc(fromTxt)} עד ${esc(toTxt)}</h1>
+<div class="m">${jobs.length} דיווחים · נוצר ${esc(fmtDT(Date.now()))} · עובד גם בלי אינטרנט</div>
+<input id="q" placeholder="חיפוש: מספר רישוי, לקוח, עובד, מילה מהעבודה"></div>
+${jobs.map(card).join('\n')}
+<script>document.getElementById('q').oninput=function(){var v=this.value.trim().toLowerCase().replace(/-/g,'');document.querySelectorAll('.job').forEach(function(s){s.style.display=!v||s.dataset.s.replace(/-/g,'').indexOf(v)>=0?'':'none'})}</script>
+</body></html>`;
+}
 async function adminWorks(body) {
   const reps = await reportsSorted(); const emps = await employees(true);
   const now = Date.now();
@@ -1292,6 +1422,7 @@ async function adminWorks(body) {
   const today = reps.filter(r => sameDay(r.createdAt, now)).length;
   const week = reps.filter(r => now - r.createdAt < 7 * 864e5).length;
   addTo(body,
+    exportCard(),
     h('div', { class: 'stats' }, h('div', { class: 'stat' }, h('b', {}, today), h('span', {}, 'היום')), h('div', { class: 'stat' }, h('b', {}, week), h('span', {}, '7 ימים')), h('div', { class: 'stat' }, h('b', {}, reps.length), h('span', {}, 'סה״כ'))),
     h('div', { class: 'card' }, h('h3', {}, 'חיפוש עבודות'),
       h('div', { class: 'grid2' }, f.plate, f.cust, f.worker, f.type),
