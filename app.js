@@ -4,6 +4,7 @@
 
 /* ---------- helpers ---------- */
 const $ = (s, r = document) => r.querySelector(s);
+function addTo(el, ...kids) { el.append(...kids.flat(Infinity).filter(k => k != null && k !== false)); }
 function fill(el, ...kids) { el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false).map(k => (k instanceof Node ? k : document.createTextNode(String(k))))); }
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -102,8 +103,25 @@ async function compressImage(file, max = 1600, q = 0.82) {
   } catch { return file; }
 }
 
-/* ---------- storage (local IndexedDB) ---------- */
-const DB = {
+/* ---------- cloud config (Supabase) ---------- */
+const CLOUD = { url: 'https://yopertfgqpdxxufdaomr.supabase.co', key: 'sb_publishable_RXi0Ty121HdhWB1-Lhg5-g_SMUrIG_i' };   // public browser key – data is protected by login + row-level security
+let sb = null;
+async function cloudInit() {
+  if (!CLOUD.url || !CLOUD.key) return null;
+  if (!window.supabase) await loadScript('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js');
+  sb = window.supabase.createClient(CLOUD.url, CLOUD.key, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'tg-auth' } });
+  return sb;
+}
+function niceErr(e) {
+  if (!navigator.onLine) return 'אין חיבור לאינטרנט. בדוק את החיבור ונסה שוב – מה שמילאת לא נמחק.';
+  const m = (e && (e.message || e.error_description || e.error)) || String(e);
+  if (/fetch|network|Failed to/i.test(m)) return 'בעיית תקשורת עם השרת. נסה שוב בעוד רגע – מה שמילאת לא נמחק.';
+  if (/JWT|auth|permission|policy|row-level/i.test(m)) return 'אין הרשאה – צריך להיכנס מחדש עם פרטי המוסך.';
+  return m;
+}
+
+/* ---------- local storage on this device (IndexedDB) – used before cloud / for moving old jobs ---------- */
+const LocalDB = {
   _p: null,
   open() {
     if (this._p) return this._p;
@@ -137,22 +155,82 @@ const DB = {
   put(s, v) { return this.tx(s, 'readwrite', st => st.put(v)); },
   del(s, k) { return this.tx(s, 'readwrite', st => st.delete(k)); },
   byPlate(p) { return this.tx('reports', 'readonly', st => st.index('plate').getAll(p)); },
+};
+
+/* ---------- shared cloud tables: each row = { k, data(jsonb), plate } ---------- */
+const KEYS = { reports: 'id', vehicles: 'plate', employees: 'id', settings: 'key' };
+const Remote = {
+  async get(s, k) {
+    const { data, error } = await sb.from(s).select('data').eq('k', String(k)).maybeSingle();
+    if (error) throw error; return data ? data.data : undefined;
+  },
+  async all(s) {
+    const out = []; let from = 0;
+    for (;;) {
+      const { data, error } = await sb.from(s).select('data').range(from, from + 999);
+      if (error) throw error; out.push(...data.map(r => r.data));
+      if (data.length < 1000) break; from += 1000;
+    }
+    return out;
+  },
+  async put(s, v) {
+    const row = { k: String(v[KEYS[s]]), data: v, updated_at: new Date().toISOString() };
+    if (s === 'reports') row.plate = v.plate;
+    const { error } = await sb.from(s).upsert(row); if (error) throw error;
+  },
+  async del(s, k) { const { error } = await sb.from(s).delete().eq('k', String(k)); if (error) throw error; },
+  async byPlate(p) {
+    const { data, error } = await sb.from('reports').select('data').eq('plate', p);
+    if (error) throw error; return data.map(r => r.data);
+  },
+};
+const DB = {
+  get(s, k) { return sb ? Remote.get(s, k) : LocalDB.get(s, k); },
+  all(s) { return sb ? Remote.all(s) : LocalDB.all(s); },
+  put(s, v) { return sb ? Remote.put(s, v) : LocalDB.put(s, v); },
+  del(s, k) { return sb ? Remote.del(s, k) : LocalDB.del(s, k); },
+  byPlate(p) { return sb ? Remote.byPlate(p) : LocalDB.byPlate(p); },
   async setting(k, d = null) { const r = await this.get('settings', k); return r ? r.value : d; },
   setSetting(k, v) { return this.put('settings', { key: k, value: v }); },
 };
+
+/* ---------- files: recordings, photos (cloud bucket "media") ---------- */
 const urlCache = new Map();
-async function saveBlob(blob) {
-  const id = uid();
-  const data = await new Response(blob).arrayBuffer();
-  await DB.put('blobs', { id, type: blob.type || 'application/octet-stream', data, size: blob.size, at: Date.now() });
-  return id;
-}
-async function blobURL(id) {
-  if (!id) return null;
-  if (urlCache.has(id)) return urlCache.get(id);
-  const b = await DB.get('blobs', id); if (!b) return null;
-  const u = URL.createObjectURL(new Blob([b.data], { type: b.type })); urlCache.set(id, u); return u;
-}
+const Blobs = {
+  async save(blob, id = uid()) {
+    if (sb) {
+      const { error } = await sb.storage.from('media').upload(id, blob, { contentType: blob.type || 'application/octet-stream', upsert: true });
+      if (error) throw error;
+    } else {
+      const data = await new Response(blob).arrayBuffer();
+      await LocalDB.put('blobs', { id, type: blob.type || 'application/octet-stream', data, size: blob.size, at: Date.now() });
+    }
+    return id;
+  },
+  async url(id) {
+    if (!id) return null;
+    const c = urlCache.get(id); if (c && c.exp > Date.now()) return c.u;
+    let u = null;
+    if (sb) {
+      const { data, error } = await sb.storage.from('media').createSignedUrl(id, 6 * 3600);
+      if (error || !data) return null; u = data.signedUrl;
+    } else {
+      const b = await LocalDB.get('blobs', id); if (!b) return null;
+      u = URL.createObjectURL(new Blob([b.data], { type: b.type }));
+    }
+    urlCache.set(id, { u, exp: Date.now() + 5 * 3600e3 }); return u;
+  },
+  async get(id) {
+    if (sb) { const { data, error } = await sb.storage.from('media').download(id); if (error) throw error; return data; }
+    const b = await LocalDB.get('blobs', id); return b ? new Blob([b.data], { type: b.type }) : null;
+  },
+  async del(id) {
+    if (!id) return;
+    if (sb) await sb.storage.from('media').remove([id]); else await LocalDB.del('blobs', id);
+  },
+};
+const saveBlob = b => Blobs.save(b);
+const blobURL = id => Blobs.url(id);
 async function employees(all) {
   const list = (await DB.all('employees')).sort((a, b) => a.name.localeCompare(b.name, 'he'));
   return all ? list : list.filter(e => e.active !== false);
@@ -569,7 +647,9 @@ async function route() {
   const [path, qs] = (location.hash.slice(1) || '/').split('?');
   const p = path.split('/').filter(Boolean); const q = new URLSearchParams(qs || '');
   fill(view, h('div', { class: 'empty' }, h('span', { class: 'spin' })));
+  document.body.classList.remove('locked');
   try {
+    if (sb) { const { data } = await sb.auth.getSession(); if (!data.session) { await viewLogin(); return; } }
     if (!p.length) await viewHome();
     else if (p[0] === 'new' && (p[1] === 'truck' || p[1] === 'trailer')) await viewNew(p[1], q.get('plate'));
     else if (p[0] === 'new') await viewPick();
@@ -582,9 +662,74 @@ async function route() {
     else await viewHome();
   } catch (err) {
     console.error(err);
-    fill(view, h('div', { class: 'card' }, h('h3', {}, 'אירעה שגיאה'), h('p', {}, String(err && err.message || err)), h('a', { class: 'btn', href: '#/' }, 'למסך הראשי')));
+    fill(view, h('div', { class: 'card' }, h('h3', {}, 'לא הצלחתי לטעון'), h('p', {}, niceErr(err)),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'button', onclick: () => route() }, 'נסה שוב'), h('a', { class: 'btn', href: '#/' }, 'למסך הראשי'))));
   }
   window.scrollTo(0, 0);
+}
+// when the app comes back to the screen, refresh lists so jobs from other phones show up
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !sb || (dirtyCheck && dirtyCheck())) return;
+  const p = (location.hash.slice(1) || '/').split('?')[0];
+  if (p === '/' || p === '' || p.startsWith('/history') || p.startsWith('/vehicle') || p === '/admin' || p.startsWith('/admin/works')) route();
+});
+
+/* ---------- login (one garage account per phone, stays signed in) ---------- */
+async function viewLogin() {
+  setHeader('', 'כניסה למערכת המוסך');
+  document.body.classList.add('locked');
+  const email = h('input', { class: 'input', type: 'email', autocomplete: 'username', dir: 'ltr', placeholder: 'email' });
+  const pass = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', dir: 'ltr', placeholder: 'password' });
+  const msg = h('p', { class: 'hint', hidden: true, style: 'color:var(--danger);font-weight:700' });
+  const btn = h('button', { type: 'submit', class: 'btn big primary' }, 'כניסה');
+  const form = h('form', { class: 'card' },
+    h('h3', {}, 'כניסה עם פרטי המוסך'),
+    h('p', { class: 'hint', style: 'margin-top:0' }, 'נכנסים פעם אחת בכל טלפון, והטלפון נשאר מחובר. את הפרטים מקבלים מטארק.'),
+    h('label', { class: 'lbl' }, 'אימייל המוסך'), email,
+    h('label', { class: 'lbl' }, 'סיסמה'), pass, msg, h('div', { style: 'margin-top:16px' }, btn));
+  form.addEventListener('submit', async e => {
+    e.preventDefault(); msg.hidden = true; btn.disabled = true; fill(btn, h('span', { class: 'spin' }), ' נכנס…');
+    const { error } = await sb.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
+    btn.disabled = false; fill(btn, 'כניסה');
+    if (error) { msg.hidden = false; msg.textContent = /invalid/i.test(error.message) ? 'אימייל או סיסמה לא נכונים.' : niceErr(error); return; }
+    toast('נכנסת בהצלחה ✓', 'ok'); route();
+  });
+  fill(view, form);
+}
+
+/* ---------- move jobs saved on this phone (old version) into the shared cloud ---------- */
+async function localJobsCount() {
+  if (!sb || local.get('movedLocal') === '1') return 0;
+  try { return (await LocalDB.all('reports')).filter(r => !r.demo).length; } catch { return 0; }
+}
+async function moveLocalToCloud(statusEl) {
+  const say = t => { if (statusEl) fill(statusEl, h('span', { class: 'spin' }), ' ' + t); };
+  const reports = (await LocalDB.all('reports')).filter(r => !r.demo);
+  const emps = (await LocalDB.all('employees')).filter(e => !e.demo);
+  for (const e of emps) if (!(await Remote.get('employees', e.id))) await Remote.put('employees', e);
+  let i = 0;
+  for (const r of reports) {
+    say('מעביר עבודה ' + (++i) + ' מתוך ' + reports.length + '…');
+    if (await Remote.get('reports', r.id)) continue;
+    const ids = [r.plateImage, ...r.entries.flatMap(e => [...e.photos, ...e.recordings.map(x => x.blobId)])].filter(Boolean);
+    for (const id of ids) { const b = await LocalDB.get('blobs', id); if (b) await Blobs.save(new Blob([b.data], { type: b.type }), id); }
+    await Remote.put('reports', r); await upsertVehicle(r);
+  }
+  local.set('movedLocal', '1');
+  return reports.length;
+}
+function moveLocalCard(n) {
+  const status = h('p', { class: 'hint' });
+  const btn = h('button', { type: 'button', class: 'btn ok wide' }, ic('up'), 'העבר את העבודות לענן');
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try { const c = await moveLocalToCloud(status); toast(c + ' עבודות הועברו לענן ✓', 'ok'); route(); }
+    catch (e) { console.error(e); btn.disabled = false; status.textContent = 'ההעברה נעצרה: ' + niceErr(e) + ' אפשר ללחוץ שוב – מה שכבר עבר לא יוכפל.'; }
+  };
+  return h('div', { class: 'card', style: 'border:2px solid var(--ok)' },
+    h('h3', {}, 'יש ' + n + ' עבודות ששמורות רק בטלפון הזה'),
+    h('p', { class: 'hint', style: 'margin-top:0' }, 'הן נרשמו בגרסה הקודמת. לחץ כדי להעביר אותן (כולל הקלטות ותמונות) לשמירה המשותפת, כדי שכולם יראו אותן.'),
+    btn, status);
 }
 window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', e => { if (dirtyCheck && dirtyCheck()) { e.preventDefault(); e.returnValue = ''; } });
@@ -633,14 +778,17 @@ async function vehicleButtons() {
     h('button', { class: 'vbtn', type: 'button', onclick: () => go('#/new/trailer') }, await pic(ri, TRAILER_SVG), h('span', {}, 'נגרר')));
 }
 function demoNote() {
-  return h('div', { class: 'demo-pill' }, ic('doc'), h('span', {}, 'גרסת ניסיון: העבודות נשמרות בטלפון הזה בלבד. בשלב הבא נחבר שמירה משותפת בענן לכל העובדים.'));
+  if (sb) return h('div', { class: 'demo-pill', style: 'background:var(--ok-soft);color:var(--ok)' }, ic('check'), h('span', {}, 'שמירה משותפת בענן – כל העובדים רואים את אותן עבודות.'));
+  return h('div', { class: 'demo-pill' }, ic('doc'), h('span', {}, 'גרסת ניסיון: העבודות נשמרות בטלפון הזה בלבד.'));
 }
 
 /* ---------- views ---------- */
 async function viewHome() {
   setHeader('home');
   const recent = (await reportsSorted()).slice(0, 5);
-  fill(view, 
+  const nLocal = await localJobsCount();
+  fill(view,
+    nLocal > 0 && moveLocalCard(nLocal),
     h('div', { class: 'card' }, h('h2', { class: 'pick-title' }, 'בחר סוג רכב'), await vehicleButtons()),
     h('a', { class: 'btn big dark', href: '#/history', style: 'margin-bottom:14px' }, ic('search'), 'חיפוש היסטוריית טיפולים'),
     demoNote(),
@@ -709,7 +857,7 @@ async function viewNew(type, prePlate) {
     const reps = (await DB.byPlate(p)).sort((a, b) => b.createdAt - a.createdAt);
     const today = reps.find(r => sameDay(r.createdAt, Date.now()));
     known.hidden = false;
-    fill(known, 
+    fill(known,
       h('div', {}, h('b', {}, '✓ רכב מוכר במוסך'), ' – ', reps.length + ' טיפולים קודמים', reps[0] ? ' · אחרון: ' + fmtDate(reps[0].createdAt) : ''),
       v.type !== type ? h('div', { class: 'hint' }, 'שים לב: הרכב רשום אצלנו כ' + typeName(v.type) + '.') : null,
       h('div', { class: 'row' },
@@ -756,7 +904,7 @@ async function viewNew(type, prePlate) {
       await DB.put('reports', r); await upsertVehicle(r);
       dirtyCheck = null; toast('העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
     } catch (e) {
-      console.error(e); alert('השמירה נכשלה: ' + (e && e.message || e));
+      console.error(e); alert('השמירה נכשלה: ' + niceErr(e));
       saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור עבודה');
     }
   };
@@ -787,7 +935,7 @@ async function viewHistory(q0) {
     else if (qd.length >= 2 && qd.length === q.replace(/[\s-]/g, '').length) hits = vs.filter(v => v.plate.includes(qd));
     else hits = vs.filter(v => (v.customer || '').includes(q));
     if (fromUser === true && hits.length === 1 && q && qd && hits[0].plate === qd) { go('#/vehicle/' + qd); return; }
-    fill(results, 
+    fill(results,
       h('h3', { style: 'margin:6px 2px 10px' }, q ? 'נמצאו ' + hits.length + ' רכבים' : 'רכבים אחרונים במוסך'),
       hits.length ? hits.map(v => h('button', { class: 'item', type: 'button', onclick: () => go('#/vehicle/' + v.plate) },
         h('div', { class: 'item-top' }, plateBadge(v.plate), typeTag(v.type), h('span', { class: 'grow' })),
@@ -808,7 +956,7 @@ async function viewVehicle(p) {
   setHeader('history', 'היסטוריה – ' + fmtPlate(p), '#/history');
   if (!v && !reps.length) { fill(view, h('div', { class: 'empty' }, 'הרכב לא נמצא')); return; }
   const type = (v && v.type) || reps[0].type;
-  fill(view, 
+  fill(view,
     h('div', { class: 'card' }, h('div', { class: 'item-top' }, plateBadge(p, true), typeTag(type)),
       h('dl', { class: 'kv' }, h('dt', {}, 'לקוח'), h('dd', {}, (v && v.customer) || '—'),
         type === 'truck' && [h('dt', {}, 'דגם'), h('dd', {}, (v && v.model) || '—'), h('dt', {}, 'ק״מ אחרון'), h('dd', {}, v && v.lastKm ? fmtNum(v.lastKm) : '—')],
@@ -822,7 +970,7 @@ async function viewReport(id) {
   const r = await DB.get('reports', id);
   if (!r) { setHeader('', 'דיווח'); fill(view, h('div', { class: 'empty' }, 'הדיווח לא נמצא')); return; }
   setHeader('', typeName(r.type) + ' ' + fmtPlate(r.plate));
-  fill(view, 
+  fill(view,
     h('a', { class: 'btn big primary', href: '#/report/' + id + '/add', style: 'margin-bottom:10px' }, ic('plus'), 'הוסף עבודה / הקלטה / תמונות'),
     h('a', { class: 'btn wide', href: '#/report/' + id + '/edit', style: 'margin-bottom:14px' }, ic('edit'), 'תקן טעות בדיווח'),
     await reportBody(r),
@@ -839,7 +987,7 @@ async function viewAdd(id) {
   const comp = Composer('מה נוסף');
   const worker = await WorkerPicker('מי מוסיף');
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תוספת');
-  fill(view, 
+  fill(view,
     h('div', { class: 'card' }, h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', {}, r.customer || '')),
       h('p', { class: 'hint' }, 'הדיווח נפתח ב-' + fmtDT(r.createdAt) + '. מה שנרשם קודם נשאר כמו שהוא – התוספת תישמר בנפרד עם השם והשעה.'),
       h('label', { class: 'lbl', style: 'margin-top:12px' }, 'סוג התוספת'), kinds),
@@ -850,12 +998,18 @@ async function viewAdd(id) {
     if (!comp.has()) { alert('אין מה לשמור – הקלט, כתוב או צלם.'); return; }
     const w = worker.get(); if (!w) { alert('בחר את השם שלך.'); return; }
     saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
-    const now = Date.now();
-    const fresh = await DB.get('reports', id);
-    fresh.entries.push(await buildEntry(comp, w, kind, now));
-    fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'add', kind });
-    fresh.updatedAt = now; await DB.put('reports', fresh); await upsertVehicle(fresh);
-    dirtyCheck = null; toast('התוספת נשמרה ✓', 'ok'); go('#/report/' + id);
+    try {
+      const now = Date.now();
+      const entry = await buildEntry(comp, w, kind, now);
+      const fresh = await DB.get('reports', id);
+      fresh.entries.push(entry);
+      fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'add', kind });
+      fresh.updatedAt = now; await DB.put('reports', fresh); await upsertVehicle(fresh);
+      dirtyCheck = null; toast('התוספת נשמרה ✓', 'ok'); go('#/report/' + id);
+    } catch (e) {
+      console.error(e); alert('השמירה נכשלה: ' + niceErr(e));
+      saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור תוספת');
+    }
   };
 }
 
@@ -876,7 +1030,7 @@ async function viewEdit(id) {
   }));
   const worker = await WorkerPicker('מי מתקן');
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תיקון');
-  fill(view, 
+  fill(view,
     h('div', { class: 'demo-pill' }, ic('edit'), h('span', {}, 'כל תיקון נרשם בהיסטוריית השינויים עם שם המתקן והשעה, והנוסח הקודם נשמר.')),
     h('div', { class: 'card' }, h('h3', {}, 'פרטי הרכב'),
       h('label', { class: 'lbl' }, 'מספר רישוי'), f.plate, h('label', { class: 'lbl' }, 'שם הלקוח'), f.customer,
@@ -894,7 +1048,7 @@ async function viewEdit(id) {
     const w = worker.get(); if (!w) { alert('בחר את השם של מי שמתקן.'); return; }
     const np = normPlate(f.plate.value); if (np.length < 5) { alert('מספר רישוי לא תקין'); return; }
     const now = Date.now(), changes = [];
-    const fresh = await DB.get('reports', id);
+    let fresh; try { fresh = await DB.get('reports', id); } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); return; }
     const setF = (key, label, val, show = v => v) => { const old = fresh[key] == null ? '' : fresh[key]; if ((val == null ? '' : val) !== old) { changes.push({ field: label, from: show(old), to: show(val) }); fresh[key] = val; } };
     setF('plate', 'מספר רישוי', np, fmtPlate);
     setF('customer', 'לקוח', f.customer.value.trim());
@@ -906,7 +1060,8 @@ async function viewEdit(id) {
         if (tv !== (rc.transcript || '')) { (rc.versions = rc.versions || []).push({ text: rc.transcript || '', at: now, by: w.name }); changes.push({ field: 'תמלול הקלטה ' + (j + 1) + ' – ' + x.label, from: rc.transcript, to: tv }); rc.transcript = tv; } });
     });
     fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'edit', changes });
-    fresh.updatedAt = now; await DB.put('reports', fresh); await upsertVehicle(fresh);
+    fresh.updatedAt = now;
+    try { await DB.put('reports', fresh); await upsertVehicle(fresh); } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); return; }
     dirtyCheck = null; toast('התיקון נשמר ✓', 'ok'); go('#/report/' + id);
   };
 }
@@ -952,7 +1107,7 @@ async function adminWorks(body) {
   Object.values(f).forEach(x => x.addEventListener('input', run));
   const today = reps.filter(r => sameDay(r.createdAt, now)).length;
   const week = reps.filter(r => now - r.createdAt < 7 * 864e5).length;
-  body.append(
+  addTo(body,
     h('div', { class: 'stats' }, h('div', { class: 'stat' }, h('b', {}, today), h('span', {}, 'היום')), h('div', { class: 'stat' }, h('b', {}, week), h('span', {}, '7 ימים')), h('div', { class: 'stat' }, h('b', {}, reps.length), h('span', {}, 'סה״כ'))),
     h('div', { class: 'card' }, h('h3', {}, 'חיפוש עבודות'),
       h('div', { class: 'grid2' }, f.plate, f.cust, f.worker, f.type),
@@ -967,7 +1122,7 @@ async function adminWorkers(body) {
   const name = h('input', { class: 'input', placeholder: 'שם עובד חדש' });
   const add = async () => { const n = name.value.trim(); if (!n) return; await DB.put('employees', { id: uid(), name: n, active: true, createdAt: Date.now() }); route(); };
   name.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
-  body.append(
+  addTo(body,
     h('div', { class: 'card' }, h('h3', {}, 'הוספת עובד'), name, h('button', { type: 'button', class: 'btn primary wide', style: 'margin-top:10px', onclick: add }, ic('plus'), 'הוסף עובד')),
     h('div', { class: 'card' }, h('h3', {}, 'רשימת העובדים (' + emps.length + ')'),
       emps.length ? emps.map(e => h('div', { class: 'emp' + (e.active === false ? ' off' : '') },
@@ -992,7 +1147,7 @@ async function adminChanges(body) {
       : [h('div', { class: 'empty' }, 'אין פעולות')]));
   };
   only.onchange = run;
-  body.append(h('div', { class: 'card' }, h('h3', {}, 'מי יצר, הוסיף או תיקן דיווחים'), only), out);
+  addTo(body,h('div', { class: 'card' }, h('h3', {}, 'מי יצר, הוסיף או תיקן דיווחים'), only), out);
   run();
 }
 async function adminSettings(body) {
@@ -1012,7 +1167,14 @@ async function adminSettings(body) {
   let est = '';
   try { const e = await navigator.storage.estimate(); est = 'בשימוש: ' + (e.usage / 1048576).toFixed(1) + ' MB'; } catch { }
   const SRok = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
-  body.append(
+  let who = '';
+  if (sb) { try { const { data } = await sb.auth.getSession(); who = data.session && data.session.user.email || ''; } catch { } }
+  const nLocal = await localJobsCount();
+  addTo(body,
+    sb && h('div', { class: 'card' }, h('h3', {}, 'חשבון המוסך'),
+      h('p', { class: 'hint', style: 'margin-top:0' }, 'הטלפון הזה מחובר כ-', h('b', { dir: 'ltr' }, who)),
+      h('button', { type: 'button', class: 'btn danger', onclick: async () => { if (!confirm('לנתק את הטלפון הזה מהמערכת? אפשר להיכנס שוב עם פרטי המוסך.')) return; await sb.auth.signOut(); route(); } }, 'התנתק מהטלפון הזה')),
+    nLocal > 0 && moveLocalCard(nLocal),
     h('div', { class: 'card' }, h('h3', {}, 'הקלטה ותמלול'),
       h('label', { style: 'display:flex;gap:10px;align-items:center;font-weight:700' }, live, 'תמלול חי לעברית בזמן ההקלטה'),
       h('p', { class: 'hint' }, SRok ? 'הדפדפן הזה תומך בתמלול חי.' : 'הדפדפן הזה לא תומך בתמלול חי – ההקלטה עדיין נשמרת.'),
@@ -1023,7 +1185,7 @@ async function adminSettings(body) {
     h('div', { class: 'card' }, h('h3', {}, 'קוד למסך מנהל (לא חובה)'), pin,
       h('button', { type: 'button', class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await DB.setSetting('adminPin', pin.value.trim() || null); toast('נשמר', 'ok'); } }, 'שמור קוד')),
     h('div', { class: 'card' }, h('h3', {}, 'גיבוי ושחזור'),
-      h('p', { class: 'hint', style: 'margin-top:0' }, 'בגרסת הניסיון הנתונים נמצאים רק בטלפון הזה. מומלץ לגבות מדי פעם. ' + est),
+      h('p', { class: 'hint', style: 'margin-top:0' }, sb ? 'הנתונים שמורים בענן. אפשר בנוסף להוריד עותק לקובץ.' : 'בגרסת הניסיון הנתונים נמצאים רק בטלפון הזה. מומלץ לגבות מדי פעם. ' + est),
       h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn', onclick: exportBackup }, ic('down'), 'הורד גיבוי'), h('button', { type: 'button', class: 'btn', onclick: () => imp.click() }, ic('up'), 'שחזר מגיבוי')), imp),
     h('div', { class: 'card' }, h('h3', {}, 'נתוני דוגמה (להצגה)'),
       h('p', { class: 'hint', style: 'margin-top:0' }, 'מוסיף כמה רכבים ועבודות לדוגמה כדי לראות איך נראית ההיסטוריה. אפשר למחוק אותם אחר כך.'),
@@ -1035,12 +1197,16 @@ async function adminSettings(body) {
 const toDataURL = (data, type) => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(new Blob([data], { type })); });
 async function exportBackup() {
   toast('מכין גיבוי…');
-  const blobs = await DB.all('blobs');
+  const reports = await DB.all('reports'), settings = await DB.all('settings');
+  const ids = new Set();
+  for (const r of reports) { if (r.plateImage) ids.add(r.plateImage); for (const e of r.entries) { e.photos.forEach(x => ids.add(x)); e.recordings.forEach(x => ids.add(x.blobId)); } }
+  for (const st of settings) if (/Img$/.test(st.key) && st.value) ids.add(st.value);
+  const blobs = [];
+  for (const id of ids) { try { const b = await Blobs.get(id); if (b) blobs.push({ id, type: b.type, data: b }); } catch { } }
   const data = {
     app: 'tarek-garage', v: 1, exportedAt: Date.now(),
-    reports: await DB.all('reports'), vehicles: await DB.all('vehicles'), employees: await DB.all('employees'),
-    settings: await DB.all('settings'),
-    blobs: await Promise.all(blobs.map(async b => ({ id: b.id, type: b.type, at: b.at, data: await toDataURL(b.data, b.type) }))),
+    reports, vehicles: await DB.all('vehicles'), employees: await DB.all('employees'), settings,
+    blobs: await Promise.all(blobs.map(async b => ({ id: b.id, type: b.type, data: await toDataURL(b.data, b.type) }))),
   };
   const name = 'גיבוי-מוסך-טארק-' + new Date().toISOString().slice(0, 10) + '.json';
   const file = new File([JSON.stringify(data)], name, { type: 'application/json' });
@@ -1049,7 +1215,7 @@ async function exportBackup() {
 }
 async function importBackup(f) {
   const d = JSON.parse(await f.text()); if (d.app !== 'tarek-garage') throw new Error('לא קובץ של האפליקציה');
-  for (const b of d.blobs || []) { const buf = await (await fetch(b.data)).arrayBuffer(); await DB.put('blobs', { id: b.id, type: b.type, at: b.at, data: buf, size: buf.byteLength }); }
+  for (const b of d.blobs || []) { const blob = await (await fetch(b.data)).blob(); await Blobs.save(new Blob([blob], { type: b.type }), b.id); }
   for (const s of ['reports', 'vehicles', 'employees', 'settings']) for (const x of d[s] || []) await DB.put(s, x);
 }
 
@@ -1094,7 +1260,7 @@ async function loadDemo() {
 }
 async function deleteDemo() {
   for (const r of await DB.all('reports')) if (r.demo) {
-    for (const e of r.entries) { for (const x of e.recordings) await DB.del('blobs', x.blobId); for (const p of e.photos) await DB.del('blobs', p); }
+    for (const e of r.entries) { for (const x of e.recordings) await Blobs.del(x.blobId); for (const p of e.photos) await Blobs.del(p); }
     await DB.del('reports', r.id);
   }
   for (const v of await DB.all('vehicles')) if (v.demo) await DB.del('vehicles', v.plate);
@@ -1104,4 +1270,4 @@ async function deleteDemo() {
 /* ---------- start ---------- */
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => { });
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
-route();
+cloudInit().catch(e => { console.error(e); alert('לא הצלחתי להתחבר לשרת המוסך. בדוק את החיבור לאינטרנט ורענן את הדף.'); }).finally(route);
