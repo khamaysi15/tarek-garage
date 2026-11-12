@@ -125,7 +125,14 @@ Deno.serve(async (req) => {
       case 'listUsers': {
         const { data, error } = await db.from('profiles').select('*').order('name');
         if (error) throw error;
-        return json({ users: data });
+        // add each login's last sign-in time from the auth system
+        const signIns: Record<string, string | null> = {};
+        for (let page = 1; page < 20; page++) {
+          const { data: u } = await db.auth.admin.listUsers({ page, perPage: 200 });
+          (u?.users || []).forEach((x: any) => { signIns[x.id] = x.last_sign_in_at || null; });
+          if (!u || u.users.length < 200) break;
+        }
+        return json({ users: (data || []).map((p: any) => ({ ...p, last_sign_in_at: signIns[p.user_id] || null })) });
       }
       case 'createUser': {
         // a plain username (e.g. "khaled") becomes an internal address nobody sees; a real email also works

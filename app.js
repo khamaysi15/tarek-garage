@@ -70,6 +70,15 @@ const fmtDate = t => dFmt.format(new Date(t));
 const fmtTime = t => tFmt.format(new Date(t));
 const fmtDT = t => fmtDate(t) + ' · ' + fmtTime(t);
 const fmtNum = n => Number(n).toLocaleString('he-IL');
+const ago = t => {
+  if (!t) return 'עוד לא';
+  const m = Math.round((Date.now() - new Date(t).getTime()) / 60e3);
+  if (m < 2) return 'עכשיו';
+  if (m < 60) return 'לפני ' + m + ' דקות';
+  if (sameDay(t, Date.now())) return 'היום ' + fmtTime(t);
+  if (sameDay(t, Date.now() - 864e5)) return 'אתמול ' + fmtTime(t);
+  return fmtDate(t) + ' ' + fmtTime(t);
+};
 const fmtDur = s => { s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 const typeName = t => (t === 'trailer' ? 'נגרר' : 'משאית');
 const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
@@ -731,6 +740,7 @@ async function route() {
       if (!data.session) { me = null; await viewLogin(); return; }
       if (!me || me.user_id !== data.session.user.id) me = await loadMe();
       if (!me || !me.active) { viewNoAccess(); return; }
+      if (Date.now() - (+local.get('seenAt', 0)) > 5 * 60e3) { local.set('seenAt', String(Date.now())); sb.rpc('touch_seen').then(() => { }, () => { }); }
     }
     if (!p.length) await viewHome();
     else if (p[0] === 'new' && (p[1] === 'truck' || p[1] === 'trailer')) await viewNew(p[1], q.get('plate'));
@@ -1288,7 +1298,7 @@ const USER_ERR = {
 const userErr = e => { const m = String(e && e.message || e); return USER_ERR[m] || (/already been registered|already exists/i.test(m) ? 'כבר קיים משתמש עם שם המשתמש הזה.' : niceErr(e)); };
 async function adminUsers(body) {
   let users;
-  try { users = (await garageCall({ action: 'listUsers' })).users || []; }
+  try { users = ((await garageCall({ action: 'listUsers' })).users || []).sort((a, b) => (Date.parse(b.last_seen || 0) || 0) - (Date.parse(a.last_seen || 0) || 0)); }
   catch (e) { addTo(body, h('div', { class: 'card' }, h('h3', {}, 'לא הצלחתי לטעון משתמשים'), h('p', {}, userErr(e)))); return; }
   const call = async (payload, okMsg) => { try { await garageCall(payload); toast(okMsg, 'ok'); me = null; route(); } catch (e) { alert(userErr(e)); } };
   const f = {
@@ -1300,8 +1310,13 @@ async function adminUsers(body) {
   const addBtn = h('button', { type: 'button', class: 'btn primary wide', style: 'margin-top:12px' }, ic('plus'), 'צור משתמש');
   addBtn.onclick = async () => {
     addBtn.disabled = true;
-    const login = f.email.value.trim().toLowerCase();
-    await call({ action: 'createUser', name: f.name.value.trim(), login, password: f.pass.value, role: f.role.value }, 'המשתמש נוצר ✓ – שם משתמש: ' + login);
+    const login = f.email.value.trim().toLowerCase(), pw = f.pass.value, nm = f.name.value.trim();
+    try { await garageCall({ action: 'createUser', name: nm, login, password: pw, role: f.role.value }); }
+    catch (e) { alert(userErr(e)); addBtn.disabled = false; return; }
+    const msg = 'פרטי כניסה לאפליקציית מוסך טארק\n' + nm + '\nשם משתמש: ' + login + '\nסיסמה: ' + pw + '\n' + location.origin + location.pathname;
+    try { await navigator.clipboard.writeText(msg); } catch { }
+    alert('המשתמש נוצר ✓\n\nשם משתמש: ' + login + '\nסיסמה: ' + pw + '\n\nהפרטים הועתקו – אפשר להדביק ולשלוח לעובד.\nשמור את הסיסמה: אחרי שתסגור את החלון אי אפשר לראות אותה שוב (אפשר רק לקבוע חדשה).');
+    me = null; route();
     addBtn.disabled = false;
   };
   const row = u => {
@@ -1310,10 +1325,17 @@ async function adminUsers(body) {
       h('div', { class: 'grow' },
         h('div', { class: 'name', style: 'font-weight:700' }, u.name || '—', self ? ' (אתה)' : ''),
         h('div', { class: 'hint', style: 'margin:0' }, 'כניסה: ', h('b', { dir: 'ltr' }, showLogin(u.email))),
-        h('div', { class: 'hint', style: 'margin:0' }, (u.role === 'admin' ? 'מנהל' : 'עובד') + (u.active ? '' : ' · מושבת'))),
+        h('div', { class: 'hint', style: 'margin:0' }, (u.role === 'admin' ? 'מנהל' : 'עובד') + (u.active ? '' : ' · מושבת')),
+        h('div', { class: 'hint', style: 'margin:0' }, 'השתמש לאחרונה: ', h('b', {}, ago(u.last_seen)), ' · התחבר לאחרונה: ', ago(u.last_sign_in_at))),
       h('div', { class: 'row', style: 'gap:6px;justify-content:flex-end' },
         h('button', { type: 'button', class: 'btn sm', onclick: () => { const n = (prompt('שם חדש:', u.name) || '').trim(); if (n && n !== u.name) call({ action: 'updateUser', user_id: u.user_id, name: n }, 'השם עודכן'); } }, 'שם'),
-        h('button', { type: 'button', class: 'btn sm', onclick: () => { const pw = prompt('סיסמה חדשה עבור ' + u.name + ' (לפחות 6 תווים):'); if (pw) call({ action: 'updateUser', user_id: u.user_id, password: pw }, 'הסיסמה עודכנה'); } }, 'סיסמה'),
+        h('button', { type: 'button', class: 'btn sm', onclick: async () => {
+          const pw = prompt('סיסמה חדשה עבור ' + u.name + ' (לפחות 6 תווים):'); if (!pw) return;
+          try { await garageCall({ action: 'updateUser', user_id: u.user_id, password: pw }); } catch (e) { alert(userErr(e)); return; }
+          const msg = 'מוסך טארק – ' + u.name + '\nשם משתמש: ' + showLogin(u.email) + '\nסיסמה חדשה: ' + pw;
+          try { await navigator.clipboard.writeText(msg); } catch { }
+          alert('הסיסמה עודכנה ✓\n\nשם משתמש: ' + showLogin(u.email) + '\nסיסמה: ' + pw + '\n\nהפרטים הועתקו – אפשר לשלוח לעובד.');
+        } }, 'סיסמה'),
         !self && h('button', { type: 'button', class: 'btn sm', onclick: () => call({ action: 'updateUser', user_id: u.user_id, role: u.role === 'admin' ? 'worker' : 'admin' }, 'התפקיד עודכן') }, u.role === 'admin' ? 'הפוך לעובד' : 'הפוך למנהל'),
         !self && h('button', { type: 'button', class: 'btn sm danger', onclick: () => { if (confirm('למחוק לגמרי את המשתמש ' + u.name + '? הוא לא יוכל להיכנס. העבודות שרשם נשארות עם השם שלו.')) call({ action: 'deleteUser', user_id: u.user_id }, 'המשתמש נמחק'); } }, 'מחק'),
         !self && h('button', { type: 'button', class: 'btn sm ' + (u.active ? 'danger' : ''), onclick: () => { if (!u.active || confirm('להשבית את ' + u.name + '? הוא לא יוכל להיכנס, והעבודות שלו נשמרות.')) call({ action: 'updateUser', user_id: u.user_id, active: !u.active }, u.active ? 'המשתמש הושבת' : 'המשתמש הופעל'); } }, u.active ? 'השבת' : 'הפעל')));
@@ -1325,7 +1347,7 @@ async function adminUsers(body) {
       h('label', { class: 'lbl' }, 'שם משתמש לכניסה'), f.email,
       h('p', { class: 'hint', style: 'margin:4px 0 0' }, 'אותיות באנגלית ומספרים, בלי רווחים. אפשר גם אימייל.'),
       h('label', { class: 'lbl' }, 'סיסמה'), f.pass, h('label', { class: 'lbl' }, 'תפקיד'), f.role, addBtn),
-    h('div', { class: 'card' }, h('h3', {}, 'משתמשים (' + users.length + ')'), users.map(row),
+    h('div', { class: 'card' }, h('h3', {}, 'משתמשים (' + users.length + ')'), h('p', { class: 'hint', style: 'margin-top:0' }, 'מסודר לפי מי שהשתמש באפליקציה לאחרונה.'), users.map(row),
       h('p', { class: 'hint' }, 'משתמש מושבת לא יכול להיכנס, אבל כל העבודות שלו נשמרות.')));
   // names in the worker list that have no login (added in the first version, or by hand)
   const loose = (await employees(true)).filter(e => !e.userId && !users.some(u => u.employee_id === e.id));
