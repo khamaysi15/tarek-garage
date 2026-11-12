@@ -888,8 +888,13 @@ function PlateField(onChange, opts = {}) {
     if (fromPhotos && normPlate(input.value)) return;
     if (!fromPhotos || !state.image) { state.image = blob; preview.src = URL.createObjectURL(blob); preview.hidden = !opts.keepPhoto; }
     status.hidden = false; status.className = 'ocr-status'; fill(status, h('span', { class: 'spin' }), fromPhotos ? ' מחפש את מספר הרישוי בתמונה…' : ' מזהה את מספר הרישוי…');
-    let plate = null, failed = false;
-    if (aiOn()) { try { plate = await aiPlate(blob); } catch (e) { console.warn('AI plate failed', e); failed = true; } }
+    let plate = null, failed = false, why = '';
+    if (aiOn()) {
+      for (let attempt = 0; attempt < 2 && !plate; attempt++) {
+        try { plate = await aiPlate(blob); failed = false; break; }
+        catch (e) { console.warn('AI plate failed', e); failed = true; why = String(e && e.message || e); if (attempt === 0) await sleep(2500); }
+      }
+    }
     if (!plate && (!aiOn() || failed)) { try { plate = (await OCR.readPlate(blob)).plate; } catch (e) { console.warn(e); } }
     if (fromPhotos && normPlate(input.value)) { status.hidden = true; return; } // the worker typed meanwhile
     if (plate) {
@@ -898,7 +903,10 @@ function PlateField(onChange, opts = {}) {
     } else if (fromPhotos) {
       status.hidden = true;
     } else {
-      status.className = 'ocr-status bad'; status.textContent = 'לא הצלחתי לקרוא את המספר. צלם שוב כך שהלוחית תיראה, או הקלד ידנית.';
+      status.className = 'ocr-status bad';
+      status.textContent = failed
+        ? 'הזיהוי בענן לא זמין כרגע (' + (/gemini (429|503)|busy|unavailable/i.test(why) ? 'השרת של Google עמוס' : why.slice(0, 80)) + '). הקלד את המספר ידנית או נסה שוב בעוד דקה.'
+        : 'לא הצלחתי לקרוא את המספר. צלם שוב כך שהלוחית תיראה, או הקלד ידנית.';
     }
   }
   for (const inp of [file, gallery]) inp.onchange = async () => {

@@ -89,16 +89,27 @@ Deno.serve(async (req) => {
 
     const body = await req.json();
     const isAdmin = me.role === 'admin';
+    const log = (action: string, ok: boolean, model: string | null, t0: number, error: string | null) =>
+      db.from('ai_log').insert({ action, ok, model, ms: Date.now() - t0, error: error && error.slice(0, 500), user_email: user.email }).then(() => {}, () => {});
 
     switch (body.action) {
       case 'transcribe': {
         if (!body.audio) return json({ error: 'no_audio' }, 400);
-        const { text, model } = await gemini([{ text: TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]);
-        return json({ text, model });
+        const t0 = Date.now();
+        try {
+          const { text, model } = await gemini([{ text: TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]);
+          await log('transcribe', true, model, t0, null);
+          return json({ text, model });
+        } catch (e) { await log('transcribe', false, null, t0, String((e as Error).message || e)); throw e; }
       }
       case 'plate': {
         if (!body.image) return json({ error: 'no_image' }, 400);
-        const { text: out, model } = await gemini([{ text: PLATE_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true);
+        const t0 = Date.now();
+        let out = '', model = '';
+        try {
+          ({ text: out, model } = await gemini([{ text: PLATE_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true));
+          await log('plate', true, model, t0, 'answer: ' + out.slice(0, 120));
+        } catch (e) { await log('plate', false, null, t0, String((e as Error).message || e)); throw e; }
         let p: any = {};
         try { p = JSON.parse(out); } catch { p = { plate: (out.match(/\d{5,8}/) || [''])[0] }; }
         const plate = String(p.plate || '').replace(/\D/g, '');
