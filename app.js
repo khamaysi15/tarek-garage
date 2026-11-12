@@ -1478,5 +1478,5 @@ async function deleteDemo() {
 
 /* ---------- start ---------- */
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => { });
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => r.update()).catch(() => { });
 cloudInit().catch(e => { console.error(e); alert('לא הצלחתי להתחבר לשרת המוסך. בדוק את החיבור לאינטרנט ורענן את הדף.'); }).finally(route);
