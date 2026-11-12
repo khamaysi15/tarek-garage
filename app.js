@@ -108,6 +108,9 @@ const CLOUD = { url: 'https://yopertfgqpdxxufdaomr.supabase.co', key: 'sb_publis
 let sb = null;
 let me = null;   // signed-in person's profile: { user_id, name, email, role: 'admin'|'worker', employee_id, active }
 const isAdmin = () => !sb || !!(me && me.role === 'admin');
+const myEid = () => (me ? me.employee_id || 'u-' + me.user_id : null);
+const canEditDetails = r => isAdmin() || r.createdBy === myEid();
+const canEditEntry = e => isAdmin() || e.workerId === myEid();
 const USER_DOMAIN = '@users.invalid';   // usernames are stored as <name>@users.invalid – never shown, never mailed
 const loginToEmail = v => { v = String(v || '').trim().toLowerCase(); return v.includes('@') ? v : v + USER_DOMAIN; };
 const showLogin = e => String(e || '').replace(USER_DOMAIN, '');
@@ -122,7 +125,15 @@ async function cloudInit() {
   sb = window.supabase.createClient(CLOUD.url, CLOUD.key, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'tg-auth' } });
   return sb;
 }
+const RULE_ERR = {
+  not_your_work: 'אפשר לשנות רק עבודה שאתה רשמת. עבודה של עובד אחר משנה רק מנהל.',
+  not_your_report: 'את פרטי הרכב בדיווח הזה יכול לשנות רק מי שפתח אותו, או מנהל.',
+  cannot_delete_work: 'רק מנהל יכול למחוק עבודה.',
+  cannot_change_history: 'אי אפשר לשנות את היסטוריית השינויים.',
+};
 function niceErr(e) {
+  const raw = (e && (e.message || e.error)) || String(e);
+  for (const k in RULE_ERR) if (raw.includes(k)) return RULE_ERR[k];
   if (!navigator.onLine) return 'אין חיבור לאינטרנט. בדוק את החיבור ונסה שוב – מה שמילאת לא נמחק.';
   const m = (e && (e.message || e.error_description || e.error)) || String(e);
   if (/fetch|network|Failed to/i.test(m)) return 'בעיית תקשורת עם השרת. נסה שוב בעוד רגע – מה שמילאת לא נמחק.';
@@ -186,7 +197,12 @@ const Remote = {
   async put(s, v) {
     const row = { k: String(v[KEYS[s]]), data: v, updated_at: new Date().toISOString() };
     if (s === 'reports') row.plate = v.plate;
-    const { error } = await sb.from(s).upsert(row); if (error) throw error;
+    const up = await sb.from(s).update(row).eq('k', row.k).select('k');
+    if (up.error) throw up.error;
+    if (up.data && up.data.length) return;
+    const ins = await sb.from(s).insert(row);
+    if (ins.error && /duplicate key/i.test(ins.error.message)) throw new Error('not_your_work');
+    if (ins.error) throw ins.error;
   },
   async del(s, k) { const { error } = await sb.from(s).delete().eq('k', String(k)); if (error) throw error; },
   async byPlate(p) {
@@ -772,7 +788,7 @@ async function viewLogin() {
 
 /* ---------- move jobs saved on this phone (old version) into the shared cloud ---------- */
 async function localJobsCount() {
-  if (!sb || local.get('movedLocal') === '1') return 0;
+  if (!sb || !isAdmin() || local.get('movedLocal') === '1') return 0;
   try { return (await LocalDB.all('reports')).filter(r => !r.demo).length; } catch { return 0; }
 }
 async function moveLocalToCloud(statusEl) {
@@ -1063,9 +1079,20 @@ async function viewReport(id) {
   setHeader('', typeName(r.type) + ' ' + fmtPlate(r.plate));
   fill(view,
     h('a', { class: 'btn big primary', href: '#/report/' + id + '/add', style: 'margin-bottom:10px' }, ic('plus'), 'הוסף עבודה / הקלטה / תמונות'),
-    h('a', { class: 'btn wide', href: '#/report/' + id + '/edit', style: 'margin-bottom:14px' }, ic('edit'), 'תקן טעות בדיווח'),
+    (canEditDetails(r) || r.entries.some(canEditEntry))
+      ? h('a', { class: 'btn wide', href: '#/report/' + id + '/edit', style: 'margin-bottom:14px' }, ic('edit'), isAdmin() ? 'תקן או מחק בדיווח' : 'תקן טעות בעבודה שלי')
+      : h('p', { class: 'hint', style: 'margin:0 0 14px' }, 'אפשר להוסיף עבודה לדיווח הזה. תיקון של עבודה שרשם עובד אחר – רק מנהל.'),
     await reportBody(r),
-    h('a', { class: 'btn wide', href: '#/vehicle/' + r.plate }, ic('clock'), 'כל הטיפולים של הרכב הזה'));
+    h('a', { class: 'btn wide', href: '#/vehicle/' + r.plate }, ic('clock'), 'כל הטיפולים של הרכב הזה'),
+    isAdmin() && sb && h('button', { type: 'button', class: 'btn wide danger', style: 'margin-top:10px', onclick: async () => {
+      if (!confirm('למחוק את כל הדיווח של ' + fmtPlate(r.plate) + ' מ-' + fmtDate(r.createdAt) + '?\nכולל ההקלטות והתמונות. אי אפשר לבטל.')) return;
+      try {
+        const ids = [r.plateImage, ...r.entries.flatMap(e => [...e.photos, ...e.recordings.map(x => x.blobId)])].filter(Boolean);
+        await DB.del('reports', r.id);
+        for (const b of ids) { try { await Blobs.del(b); } catch { } }
+        toast('הדיווח נמחק', 'ok'); go('#/vehicle/' + r.plate);
+      } catch (e) { alert('המחיקה נכשלה: ' + niceErr(e)); }
+    } }, ic('trash'), 'מחק את כל הדיווח (מנהל)'));
 }
 
 async function viewAdd(id) {
@@ -1115,25 +1142,40 @@ async function viewEdit(id) {
     model: h('input', { class: 'input', value: r.model || '' }),
     km: h('input', { class: 'input', inputmode: 'numeric', value: r.km ? String(r.km) : '' }),
   };
-  const entryFields = r.entries.map((e, i) => ({
-    e, ta: h('textarea', { class: 'input', rows: 3, value: e.text || '' }),
-    recs: e.recordings.map(rc => ({ rc, ta: h('textarea', { class: 'input', rows: 2, value: rc.transcript || '' }) })),
-    label: e.kind === 'note' ? 'הערה' : i === 0 ? 'העבודה שבוצעה' : 'עבודה נוספת ' + i,
-  }));
+  const headOk = canEditDetails(r);
+  if (!headOk) Object.values(f).forEach(x => { x.disabled = true; });
+  const deleted = new Set();
+  const entryFields = r.entries.map((e, i) => {
+    const ok = canEditEntry(e);
+    const ta = h('textarea', { class: 'input', rows: 3, value: e.text || '', disabled: !ok });
+    return { e, ok, ta,
+      recs: e.recordings.map(rc => ({ rc, ta: h('textarea', { class: 'input', rows: 2, value: rc.transcript || '', disabled: !ok }) })),
+      label: e.kind === 'note' ? 'הערה' : i === 0 ? 'העבודה שבוצעה' : 'עבודה נוספת ' + i };
+  });
   const worker = await WorkerPicker('מי מתקן');
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תיקון');
   fill(view,
     h('div', { class: 'demo-pill' }, ic('edit'), h('span', {}, 'כל תיקון נרשם בהיסטוריית השינויים עם שם המתקן והשעה, והנוסח הקודם נשמר.')),
+    !isAdmin() && h('p', { class: 'hint', style: 'margin:0 0 12px' }, 'אפשר לתקן רק את מה שאתה רשמת. החלקים האפורים נרשמו ע״י אחרים – תיקון שלהם רק אצל מנהל.'),
     h('div', { class: 'card' }, h('h3', {}, 'פרטי הרכב'),
+      !headOk && h('p', { class: 'hint', style: 'margin-top:0' }, 'נפתח ע״י ' + (r.createdByName || 'עובד אחר') + ' – רק הוא או מנהל יכולים לשנות.'),
       h('label', { class: 'lbl' }, 'מספר רישוי'), f.plate, h('label', { class: 'lbl' }, 'שם הלקוח'), f.customer,
       isTruck && [h('label', { class: 'lbl' }, 'דגם'), f.model, h('label', { class: 'lbl' }, 'קילומטרים'), f.km]),
-    entryFields.map(x => h('div', { class: 'card' }, h('h3', {}, x.label + ' · ' + fmtDT(x.e.at) + ' · ' + x.e.workerName),
-      h('label', { class: 'lbl' }, 'טקסט'), x.ta,
-      x.recs.map((y, j) => [h('label', { class: 'lbl' }, 'תמלול הקלטה ' + (j + 1)), y.ta]))),
+    entryFields.map((x, i) => {
+      const card = h('div', { class: 'card', style: x.ok ? '' : 'opacity:.6' }, h('h3', {}, x.label + ' · ' + fmtDT(x.e.at) + ' · ' + x.e.workerName),
+        h('label', { class: 'lbl' }, 'טקסט'), x.ta,
+        x.recs.map((y, j) => [h('label', { class: 'lbl' }, 'תמלול הקלטה ' + (j + 1)), y.ta]),
+        isAdmin() && sb && r.entries.length > 1 && h('button', { type: 'button', class: 'btn sm danger', style: 'margin-top:12px', onclick: () => {
+          if (deleted.has(i)) { deleted.delete(i); card.style.outline = ''; return; }
+          if (!confirm('למחוק את הקטע "' + x.label + '" (כולל ההקלטות והתמונות שלו)? המחיקה תתבצע בשמירה.')) return;
+          deleted.add(i); card.style.outline = '3px solid var(--danger)';
+        } }, ic('trash'), 'מחק קטע זה (מנהל)'));
+      return card;
+    }),
     worker.el, saveBtn);
   const dirty = () => normPlate(f.plate.value) !== r.plate || f.customer.value.trim() !== (r.customer || '') ||
     (isTruck && (f.model.value.trim() !== (r.model || '') || (+normPlate(f.km.value) || null) !== (r.km || null))) ||
-    entryFields.some(x => x.ta.value.trim() !== (x.e.text || '') || x.recs.some(y => y.ta.value.trim() !== (y.rc.transcript || '')));
+    entryFields.some(x => x.ta.value.trim() !== (x.e.text || '') || x.recs.some(y => y.ta.value.trim() !== (y.rc.transcript || ''))) || deleted.size > 0;
   dirtyCheck = dirty;
   saveBtn.onclick = async () => {
     if (!dirty()) { toast('לא בוצעו שינויים'); return; }
@@ -1142,18 +1184,28 @@ async function viewEdit(id) {
     const now = Date.now(), changes = [];
     let fresh; try { fresh = await DB.get('reports', id); } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); return; }
     const setF = (key, label, val, show = v => v) => { const old = fresh[key] == null ? '' : fresh[key]; if ((val == null ? '' : val) !== old) { changes.push({ field: label, from: show(old), to: show(val) }); fresh[key] = val; } };
-    setF('plate', 'מספר רישוי', np, fmtPlate);
-    setF('customer', 'לקוח', f.customer.value.trim());
-    if (isTruck) { setF('model', 'דגם', f.model.value.trim()); setF('km', 'קילומטרים', +normPlate(f.km.value) || null, v => v ? fmtNum(v) : ''); }
+    if (headOk) {
+      setF('plate', 'מספר רישוי', np, fmtPlate);
+      setF('customer', 'לקוח', f.customer.value.trim());
+      if (isTruck) { setF('model', 'דגם', f.model.value.trim()); setF('km', 'קילומטרים', +normPlate(f.km.value) || null, v => v ? fmtNum(v) : ''); }
+    }
     entryFields.forEach((x, i) => {
-      const e = fresh.entries[i]; const nv = x.ta.value.trim();
+      if (!x.ok) return;
+      const e = fresh.entries.find(z => z.id === x.e.id); if (!e) return; const nv = x.ta.value.trim();
       if (nv !== (e.text || '')) { (e.versions = e.versions || []).push({ text: e.text || '', at: now, by: w.name }); changes.push({ field: 'טקסט – ' + x.label, from: e.text, to: nv }); e.text = nv; }
       x.recs.forEach((y, j) => { const rc = e.recordings[j]; const tv = y.ta.value.trim();
         if (tv !== (rc.transcript || '')) { (rc.versions = rc.versions || []).push({ text: rc.transcript || '', at: now, by: w.name }); changes.push({ field: 'תמלול הקלטה ' + (j + 1) + ' – ' + x.label, from: rc.transcript, to: tv }); rc.transcript = tv; } });
     });
+    const gone = [];
+    if (deleted.size) {
+      const ids = new Set([...deleted].map(i => entryFields[i].e.id));
+      fresh.entries = fresh.entries.filter(e => { if (ids.has(e.id)) { gone.push(e); return false; } return true; });
+      gone.forEach(e => changes.push({ field: 'נמחק קטע של ' + e.workerName + ' מ-' + fmtDT(e.at), from: e.text || e.recordings.map(x => x.transcript).join(' '), to: '' }));
+    }
     fresh.log.push({ at: now, workerId: w.id, workerName: w.name, action: 'edit', changes });
     fresh.updatedAt = now;
     try { await DB.put('reports', fresh); await upsertVehicle(fresh); } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); return; }
+    for (const e of gone) for (const b of [...e.photos, ...e.recordings.map(x => x.blobId)]) { try { await Blobs.del(b); } catch { } }
     dirtyCheck = null; toast('התיקון נשמר ✓', 'ok'); go('#/report/' + id);
   };
 }
@@ -1263,6 +1315,7 @@ async function adminUsers(body) {
         h('button', { type: 'button', class: 'btn sm', onclick: () => { const n = (prompt('שם חדש:', u.name) || '').trim(); if (n && n !== u.name) call({ action: 'updateUser', user_id: u.user_id, name: n }, 'השם עודכן'); } }, 'שם'),
         h('button', { type: 'button', class: 'btn sm', onclick: () => { const pw = prompt('סיסמה חדשה עבור ' + u.name + ' (לפחות 6 תווים):'); if (pw) call({ action: 'updateUser', user_id: u.user_id, password: pw }, 'הסיסמה עודכנה'); } }, 'סיסמה'),
         !self && h('button', { type: 'button', class: 'btn sm', onclick: () => call({ action: 'updateUser', user_id: u.user_id, role: u.role === 'admin' ? 'worker' : 'admin' }, 'התפקיד עודכן') }, u.role === 'admin' ? 'הפוך לעובד' : 'הפוך למנהל'),
+        !self && h('button', { type: 'button', class: 'btn sm danger', onclick: () => { if (confirm('למחוק לגמרי את המשתמש ' + u.name + '? הוא לא יוכל להיכנס. העבודות שרשם נשארות עם השם שלו.')) call({ action: 'deleteUser', user_id: u.user_id }, 'המשתמש נמחק'); } }, 'מחק'),
         !self && h('button', { type: 'button', class: 'btn sm ' + (u.active ? 'danger' : ''), onclick: () => { if (!u.active || confirm('להשבית את ' + u.name + '? הוא לא יוכל להיכנס, והעבודות שלו נשמרות.')) call({ action: 'updateUser', user_id: u.user_id, active: !u.active }, u.active ? 'המשתמש הושבת' : 'המשתמש הופעל'); } }, u.active ? 'השבת' : 'הפעל')));
   };
   addTo(body,

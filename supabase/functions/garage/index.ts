@@ -141,7 +141,8 @@ Deno.serve(async (req) => {
         const { data: c, error } = await db.auth.admin.createUser({ email, password: String(body.password), email_confirm: true });
         if (error) return json({ error: error.message }, 400);
         const uid = c.user!.id, eid = 'u-' + uid;
-        await db.from('profiles').insert({ user_id: uid, email, name, role, employee_id: eid, active: true });
+        // a database trigger already created a default worker profile; set the real name and role
+        await db.from('profiles').upsert({ user_id: uid, email, name, role, employee_id: eid, active: true });
         await db.from('employees').upsert({ k: eid, data: { id: eid, name, active: true, userId: uid, createdAt: Date.now() } });
         return json({ ok: true, user_id: uid });
       }
@@ -165,6 +166,18 @@ Deno.serve(async (req) => {
         const { data: emp } = await db.from('employees').select('data').eq('k', eid).maybeSingle();
         const ed = { ...(emp?.data || { id: eid, userId: uid }), name: patch.name ?? target.name, active: patch.active ?? target.active };
         await db.from('employees').upsert({ k: eid, data: ed });
+        return json({ ok: true });
+      }
+      case 'deleteUser': {
+        const uid = String(body.user_id || '');
+        if (!uid || uid === user.id) return json({ error: 'cannot_lock_yourself_out' }, 400);
+        const { data: target } = await db.from('profiles').select('*').eq('user_id', uid).maybeSingle();
+        const { error } = await db.auth.admin.deleteUser(uid);
+        if (error) return json({ error: error.message }, 400);
+        // keep the worker's name on old jobs; just mark the name inactive
+        const eid = target?.employee_id || 'u-' + uid;
+        const { data: emp } = await db.from('employees').select('data').eq('k', eid).maybeSingle();
+        if (emp) await db.from('employees').upsert({ k: eid, data: { ...emp.data, active: false } });
         return json({ ok: true });
       }
     }
