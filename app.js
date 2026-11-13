@@ -386,8 +386,10 @@ const OCR = {
 
 /* ---------- AI on the garage server (Gemini via Supabase function "garage") ---------- */
 const toB64 = blob => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1] || ''); fr.onerror = rej; fr.readAsDataURL(blob); });
-async function garageCall(body) {
-  const { data, error } = await sb.functions.invoke('garage', { body });
+async function garageCall(body, ms = 60000) {
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), ms); });
+  const { data, error } = await Promise.race([sb.functions.invoke('garage', { body }), timeout]).finally(() => clearTimeout(timer));
   if (error) { let m = error.message; try { const j = await error.context.json(); m = j.error || m; } catch { } throw new Error(m); }
   if (data && data.error) throw new Error(data.error);
   return data;
@@ -412,12 +414,12 @@ async function toWav16k(blob) {
 }
 async function aiTranscribe(blob, short) {
   let a = blob; try { a = await toWav16k(blob); } catch (e) { console.warn('wav convert failed, sending original', e); }
-  const r = await garageCall({ action: 'transcribe', short: !!short, audio: await toB64(a), mime: (a.type || 'audio/mp4').split(';')[0] });
+  const r = await garageCall({ action: 'transcribe', short: !!short, audio: await toB64(a), mime: (a.type || 'audio/mp4').split(';')[0] }, short ? 20000 : 40000);
   return (r.text || '').trim();
 }
 async function aiSku(blob) {
   const small = await compressImage(blob, 1600, 0.85);
-  return garageCall({ action: 'sku', image: await toB64(small), mime: 'image/jpeg' });
+  return garageCall({ action: 'sku', image: await toB64(small), mime: 'image/jpeg' }, 25000);
 }
 /* small 🎤 button next to a text field: speak instead of typing (for workers who don't write) */
 function micFor(input, opts = {}) {
@@ -453,7 +455,7 @@ function micFor(input, opts = {}) {
 }
 async function aiPlate(blob) {
   const small = await compressImage(blob, 1600, 0.85);
-  const r = await garageCall({ action: 'plate', image: await toB64(small), mime: 'image/jpeg' });
+  const r = await garageCall({ action: 'plate', image: await toB64(small), mime: 'image/jpeg' }, 25000);
   return r.plate || null;
 }
 
@@ -576,18 +578,22 @@ function Recorder() {
     list.push(rec); render(); setBtn();
     if (aiOn()) runCloud(rec);
   }
-  async function runCloud(rec, manual) {
+  function runCloud(rec, manual) {
     rec.busy = true; render();
-    try {
-      const text = await aiTranscribe(rec.blob);
-      if (text && (!rec.edited || manual)) { rec.transcript = text; rec.edited = false; rec.suggest = null; }
-      else if (text && text !== rec.transcript) rec.suggest = text;
-      if (!text && !rec.transcript) toast('לא זוהה דיבור בהקלטה', 'bad');
-    } catch (e) {
-      console.warn(e);
-      if (!rec.transcript) toast('שיפור התמלול לא הצליח – אפשר להקליד ידנית', 'bad');
-    }
-    rec.busy = false; render();
+    rec.promise = (async () => {
+      try {
+        const text = await aiTranscribe(rec.blob);
+        if (text && (!rec.edited || manual)) { rec.transcript = text; rec.edited = false; rec.suggest = null; }
+        else if (text && text !== rec.transcript) rec.suggest = text;
+        if (!text && !rec.transcript) toast('לא זוהה דיבור בהקלטה', 'bad');
+        return text;
+      } catch (e) {
+        console.warn(e);
+        if (!rec.transcript) toast('השיפור האוטומטי איטי כרגע – אפשר להקליד ידנית', 'bad');
+        return null;
+      } finally { rec.busy = false; render(); }
+    })();
+    return rec.promise;
   }
   function render() {
     fill(listEl, ...list.map((rec, i) => {
@@ -662,6 +668,23 @@ function Composer(title = 'מה העבודה שבוצעה', opts = {}) {
     dirty: () => !!(ta.value.trim() || rec.list.length || ph.list.length),
     cleanup: () => rec.cleanup(),
   };
+}
+// after saving: when a slower improved transcript arrives, put it into the saved report (unless the worker typed his own)
+function patchTranscriptsLater(reportId, entry, comp) {
+  comp.rec.list.forEach((rec, j) => {
+    if (!rec.busy || !rec.promise || !entry.recordings[j]) return;
+    const savedText = entry.recordings[j].transcript, recId = entry.recordings[j].id;
+    rec.promise.then(async text => {
+      if (!text || rec.edited || text === savedText) return;
+      try {
+        const r = await DB.get('reports', reportId); if (!r) return;
+        const e = r.entries.find(x => x.id === entry.id); const rc = e && e.recordings.find(x => x.id === recId);
+        if (!rc || rc.transcript !== savedText) return;
+        rc.transcript = text; await DB.put('reports', r);
+        if (location.hash === '#/report/' + reportId) route();
+      } catch (err) { console.warn('late transcript not saved', err); }
+    });
+  });
 }
 async function waitTranscripts(comp, btn) {
   if (!comp.rec.busy()) return;
@@ -992,10 +1015,8 @@ function PlateField(onChange, opts = {}) {
     status.hidden = false; status.className = 'ocr-status'; fill(status, h('span', { class: 'spin' }), fromPhotos ? ' מחפש את מספר הרישוי בתמונה…' : ' מזהה את מספר הרישוי…');
     let plate = null, failed = false, why = '';
     if (aiOn()) {
-      for (let attempt = 0; attempt < 2 && !plate; attempt++) {
-        try { plate = await aiPlate(blob); failed = false; break; }
-        catch (e) { console.warn('AI plate failed', e); failed = true; why = String(e && e.message || e); if (attempt === 0) await sleep(2500); }
-      }
+      try { plate = await aiPlate(blob); }
+      catch (e) { console.warn('AI plate failed', e); failed = true; why = String(e && e.message || e); }
     }
     if (!plate && (!aiOn() || failed)) { try { plate = (await OCR.readPlate(blob)).plate; } catch (e) { console.warn(e); } }
     if (fromPhotos && normPlate(input.value)) { status.hidden = true; return; } // the worker typed meanwhile
@@ -1007,7 +1028,7 @@ function PlateField(onChange, opts = {}) {
     } else {
       status.className = 'ocr-status bad';
       status.textContent = failed
-        ? 'הזיהוי בענן לא זמין כרגע (' + (/gemini (429|503)|busy|unavailable/i.test(why) ? 'השרת של Google עמוס' : why.slice(0, 80)) + '). הקלד את המספר ידנית או נסה שוב בעוד דקה.'
+        ? 'הזיהוי האוטומטי איטי כרגע (' + (/timeout|gemini (429|503)|busy|unavailable/i.test(why) ? 'השרת של Google עמוס' : why.slice(0, 80)) + '). הקלד את המספר ידנית או נסה שוב בעוד דקה.'
         : 'לא הצלחתי לקרוא את המספר. צלם שוב כך שהלוחית תיראה, או הקלד ידנית.';
     }
   }
@@ -1079,7 +1100,6 @@ async function viewNew(type, prePlate, rescue) {
     if (p.length < 5) { alert('הכנס מספר רישוי (או צלם את הלוחית).'); plate.input.focus(); return; }
     if (comp.rec.isRecording()) { alert('יש הקלטה פעילה – לחץ קודם "סיים הקלטה".'); return; }
     if (!comp.has()) { alert('תאר את העבודה: הקלטה, כתיבה או תמונה.'); return; }
-    if (comp.rec.busy()) { saveBtn.disabled = true; await waitTranscripts(comp, saveBtn); saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור עבודה'); }
     const w = worker.get(); if (!w) { alert('בחר את השם שלך מרשימת העובדים.'); return; }
     const kmVal = +km.value.replace(/\D/g, '') || null;
     if (isTruck && !kmVal && !confirm('לא הוזנו קילומטרים. לשמור בכל זאת?')) return;
@@ -1096,6 +1116,7 @@ async function viewNew(type, prePlate, rescue) {
         log: [{ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'create' }],
       };
       await DB.put('reports', r); await upsertVehicle(r);
+      patchTranscriptsLater(r.id, r.entries[0], comp);
       dirtyCheck = null; toast(rescue ? 'החילוץ נשמר ✓' : 'העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
     } catch (e) {
       console.error(e); alert('השמירה נכשלה: ' + niceErr(e));
@@ -1472,7 +1493,6 @@ async function viewAdd(id) {
   saveBtn.onclick = async () => {
     if (comp.rec.isRecording()) { alert('יש הקלטה פעילה – לחץ קודם "סיים הקלטה".'); return; }
     if (!comp.has()) { alert('אין מה לשמור – הקלט, כתוב או צלם.'); return; }
-    if (comp.rec.busy()) { saveBtn.disabled = true; await waitTranscripts(comp, saveBtn); saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור תוספת'); }
     const w = worker.get(); if (!w) { alert('בחר את השם שלך.'); return; }
     saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
     try {
@@ -1482,6 +1502,7 @@ async function viewAdd(id) {
       fresh.entries.push(entry);
       fresh.log.push({ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'add', kind });
       fresh.updatedAt = now; await DB.put('reports', fresh); await upsertVehicle(fresh);
+      patchTranscriptsLater(id, entry, comp);
       dirtyCheck = null; toast('התוספת נשמרה ✓', 'ok'); go('#/report/' + id);
     } catch (e) {
       console.error(e); alert('השמירה נכשלה: ' + niceErr(e));

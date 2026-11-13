@@ -38,13 +38,15 @@ async function gemini(parts: unknown[], wantJson = false): Promise<{ text: strin
     generationConfig: { temperature: 0, ...(wantJson ? { responseMimeType: 'application/json' } : {}) },
   });
   let last = '';
+  const deadline = Date.now() + 35000;
   for (let round = 0; round < 2; round++) {
     const list = await models(key);
     const ready = list.filter(m => (busyUntil.get(m) || 0) < Date.now());
     for (const model of (ready.length ? ready : list)) {
+      if (Date.now() > deadline - 3000) break;
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body,
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(Math.min(10000, Math.max(3000, deadline - Date.now()))),
       }).catch(e => ({ ok: false, status: 504, text: async () => String(e) } as any));
       if (r.ok) {
         const d = await r.json();
@@ -52,10 +54,11 @@ async function gemini(parts: unknown[], wantJson = false): Promise<{ text: strin
       }
       last = 'gemini ' + model + ' ' + r.status + ' ' + (await r.text()).slice(0, 160);
       if (r.status === 404) { busyUntil.set(model, Date.now() + 24 * 3600e3); continue; }   // retired
-      if ([429, 500, 502, 503, 504].includes(r.status)) { busyUntil.set(model, Date.now() + 3 * 60e3); continue; } // busy: skip for 3 min
+      if ([429, 500, 502, 503, 504].includes(r.status)) { busyUntil.set(model, Date.now() + 3 * 60e3); continue; } // busy or too slow: skip for 3 min
       throw new Error(last);
     }
-    await new Promise(res => setTimeout(res, 1500));  // everything busy: short pause, one more round
+    if (Date.now() > deadline - 5000) break;
+    await new Promise(res => setTimeout(res, 1000));  // everything busy: short pause, one more round
     busyUntil.clear();
   }
   throw new Error(last || 'gemini unavailable');
