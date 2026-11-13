@@ -1,6 +1,7 @@
 // מוסך טארק – server function: Hebrew transcription, plate reading, user management.
 // Secrets (set with `supabase secrets set`): GEMINI_API_KEY, optional GEMINI_MODEL.
 import { createClient } from 'npm:@supabase/supabase-js@2.118.0';
+import webpush from 'npm:web-push@3.6.7';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -81,6 +82,30 @@ Israeli plates: yellow background, black digits, usually 7 digits (NN-NNN-NN) or
 Ignore every other number in the photo (phone numbers, fleet numbers, company signs, dates).
 Answer as JSON: {"plate": "<digits only, empty if no plate is readable>", "confidence": "high" | "medium" | "low"}`;
 
+/* ---------- food reminders (Web Push) ---------- */
+const ilDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+const ilClock = () => new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+const ilWeekday = () => new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Jerusalem', weekday: 'short' }).format(new Date());
+async function sendFoodReminders(db: any, onlyMissing = true) {
+  const pub = Deno.env.get('VAPID_PUBLIC'), priv = Deno.env.get('VAPID_PRIVATE');
+  if (!pub || !priv) throw new Error('push_not_set_up');
+  webpush.setVapidDetails(Deno.env.get('VAPID_SUBJECT') || 'https://khamaysi15.github.io/tarek-garage/', pub, priv);
+  const today = ilDate();
+  const { data: profs } = await db.from('profiles').select('user_id, employee_id, active');
+  const { data: meals } = await db.from('meals').select('data').like('k', today + '_%');
+  const ordered = new Set((meals || []).map((m: any) => m.data.workerId));
+  const targets = (profs || []).filter((p: any) => p.active && (!onlyMissing || !ordered.has(p.employee_id))).map((p: any) => p.user_id);
+  if (!targets.length) return { sent: 0, people: 0 };
+  const { data: subs } = await db.from('push_subs').select('*').in('user_id', targets);
+  const payload = JSON.stringify({ title: '🍽️ הזמנת אוכל', body: 'עוד לא בחרת אוכל להיום – ההזמנה נסגרת ב-12:00', url: './#/', tag: 'food-' + today });
+  let sent = 0;
+  for (const s of subs || []) {
+    try { await webpush.sendNotification(s.sub, payload, { TTL: 3600 }); sent++; }
+    catch (e: any) { if (e && (e.statusCode === 404 || e.statusCode === 410)) await db.from('push_subs').delete().eq('endpoint', s.endpoint); }
+  }
+  return { sent, people: new Set((subs || []).map((s: any) => s.user_id)).size };
+}
+
 /* ---------- request handling ---------- */
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
@@ -88,6 +113,22 @@ Deno.serve(async (req) => {
     const url = Deno.env.get('SUPABASE_URL')!;
     const service = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const db = createClient(url, service, { auth: { persistSession: false, autoRefreshToken: false } });
+
+    // scheduled run (every 15 min in the morning): sends at most once at ~10:30 and once at ~11:30 Israel time, Sunday–Friday
+    if (new URL(req.url).searchParams.get('cron') === 'food') {
+      // reminder times are set by the admin in the app (settings → foodReminders); default 10:30 and 11:30
+      const { data: st } = await db.from('settings').select('data').eq('k', 'foodReminders').maybeSingle();
+      const times: string[] = (st?.data?.value && Array.isArray(st.data.value) ? st.data.value : ['10:30', '11:30']).filter((x: string) => /^\d\d:\d\d$/.test(x));
+      const t = ilClock();
+      const plus15 = (x: string) => { const [hh, mm] = x.split(':').map(Number), m = hh * 60 + mm + 15; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); };
+      const slot = times.find(x => t >= x && t < plus15(x)) || null;
+      if (!slot || ilWeekday() === 'Sat') return json({ skipped: t, times });
+      const { error: dup } = await db.from('reminder_runs').insert({ day: ilDate(), slot });
+      if (dup) return json({ already: slot });
+      const r = await sendFoodReminders(db);
+      await db.from('reminder_runs').update({ sent: r.sent }).eq('day', ilDate()).eq('slot', slot);
+      return json(r);
+    }
 
     const token = (req.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
     const { data: auth } = await db.auth.getUser(token);
@@ -193,6 +234,9 @@ Deno.serve(async (req) => {
         const ed = { ...(emp?.data || { id: eid, userId: uid }), name: patch.name ?? target.name, active: patch.active ?? target.active };
         await db.from('employees').upsert({ k: eid, data: ed });
         return json({ ok: true });
+      }
+      case 'remindNow': {
+        return json(await sendFoodReminders(db, body.all !== true));
       }
       case 'deleteUser': {
         const uid = String(body.user_id || '');
