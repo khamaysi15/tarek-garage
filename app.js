@@ -1123,7 +1123,7 @@ function LocationField(init = {}) {
 }
 const locLink = l => l && (l.lat ? h('a', { href: 'https://maps.google.com/?q=' + l.lat + ',' + l.lng, target: '_blank' }, (l.text || 'פתח במפה') + ' 📍') : (l.text || null));
 /* ---------- daily food order (until 12:00 Israel time) + phone reminders ---------- */
-const VAPID_PUBLIC = '';   // filled in after setup-push.sh
+const VAPID_PUBLIC = 'BNJoFKgbeccHxDkdjSBgdxjtmCl1EfBW8OZUVKx7A8eDS6PPFpXq_gwwfny_md1A4ZiTdNFui7vF4KnTr34rqOA';   // public key – safe to publish; the private half is a Supabase secret
 const ilParts = () => Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date()).map(x => [x.type, x.value]));
 const ilToday = () => { const p = ilParts(); return p.year + '-' + p.month + '-' + p.day; };
 const foodOpen = () => { const p = ilParts(); return (p.hour === '24' ? '00' : p.hour) + ':' + p.minute < '12:00'; };
