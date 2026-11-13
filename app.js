@@ -1254,7 +1254,12 @@ async function viewFood(day) {
       h('p', {}, missing.map(e => e.name).join(' · ') || 'כולם הזמינו ✓'),
       h('div', { class: 'row' },
         missing.length > 0 && h('button', { type: 'button', class: 'btn primary', onclick: async () => {
-          try { const r = await garageCall({ action: 'remindNow' }); toast('נשלחה תזכורת ל-' + r.people + ' עובדים', 'ok'); }
+          try {
+            const r = await garageCall({ action: 'remindNow' });
+            if (!r.people) alert('אף אחד מאלה שעוד לא הזמינו לא אישר התראות בטלפון שלו.');
+            else if (r.failed) alert('נשלח ל-' + r.sent + ', נכשל ל-' + r.failed + '.\n' + (r.error || ''));
+            else toast('נשלחה תזכורת ל-' + r.people + ' עובדים (' + r.sent + ' טלפונים)', 'ok');
+          }
           catch (e) { alert(/push_not_set_up/.test(e.message) ? 'ההתראות עוד לא הופעלו בשרת.' : niceErr(e)); }
         } }, '🔔 שלח תזכורת עכשיו'),
         h('span', { class: 'hint' }, 'תזכורת אוטומטית נשלחת בשעות שבחרת (א׳–ו׳) למי שעוד לא הזמין ושאישר התראות.'))),

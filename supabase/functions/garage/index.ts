@@ -101,12 +101,21 @@ async function sendFoodReminders(db: any, onlyMissing = true) {
   if (!targets.length) return { sent: 0, people: 0 };
   const { data: subs } = await db.from('push_subs').select('*').in('user_id', targets);
   const payload = JSON.stringify({ title: '🍽️ הזמנת אוכל', body: 'עוד לא בחרת אוכל להיום – ההזמנה נסגרת ב-12:00', url: './#/', tag: 'food-' + today });
-  let sent = 0;
+  let sent = 0; const errors: string[] = [];
   for (const s of subs || []) {
-    try { await webpush.sendNotification(s.sub, payload, { TTL: 3600 }); sent++; }
-    catch (e: any) { if (e && (e.statusCode === 404 || e.statusCode === 410)) await db.from('push_subs').delete().eq('endpoint', s.endpoint); }
+    const t0 = Date.now();
+    try {
+      const r: any = await webpush.sendNotification(s.sub, payload, { TTL: 3600, urgency: 'high' });
+      sent++;
+      await db.from('ai_log').insert({ action: 'push', ok: true, model: new URL(s.endpoint).host, ms: Date.now() - t0, error: 'status ' + (r && r.statusCode) });
+    } catch (e: any) {
+      const msg = 'push ' + (e?.statusCode || '') + ' ' + String(e?.body || e?.message || e).slice(0, 300);
+      errors.push(msg);
+      await db.from('ai_log').insert({ action: 'push', ok: false, model: (() => { try { return new URL(s.endpoint).host; } catch { return null; } })(), ms: Date.now() - t0, error: msg });
+      if (e && (e.statusCode === 404 || e.statusCode === 410)) await db.from('push_subs').delete().eq('endpoint', s.endpoint);
+    }
   }
-  return { sent, people: new Set((subs || []).map((s: any) => s.user_id)).size };
+  return { sent, failed: errors.length, people: new Set((subs || []).map((s: any) => s.user_id)).size, error: errors[0] || null };
 }
 
 /* ---------- request handling ---------- */
