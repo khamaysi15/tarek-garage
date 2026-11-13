@@ -169,15 +169,15 @@ const LocalDB = {
   open() {
     if (this._p) return this._p;
     this._p = new Promise((res, rej) => {
-      const r = indexedDB.open('tarek-garage', 1);
+      const r = indexedDB.open('tarek-garage', 2);
       r.onupgradeneeded = () => {
-        const d = r.result;
-        const rs = d.createObjectStore('reports', { keyPath: 'id' });
-        rs.createIndex('plate', 'plate');
-        d.createObjectStore('vehicles', { keyPath: 'plate' });
-        d.createObjectStore('employees', { keyPath: 'id' });
-        d.createObjectStore('blobs', { keyPath: 'id' });
-        d.createObjectStore('settings', { keyPath: 'key' });
+        const d = r.result, has = n => d.objectStoreNames.contains(n);
+        if (!has('reports')) d.createObjectStore('reports', { keyPath: 'id' }).createIndex('plate', 'plate');
+        if (!has('vehicles')) d.createObjectStore('vehicles', { keyPath: 'plate' });
+        if (!has('employees')) d.createObjectStore('employees', { keyPath: 'id' });
+        if (!has('blobs')) d.createObjectStore('blobs', { keyPath: 'id' });
+        if (!has('settings')) d.createObjectStore('settings', { keyPath: 'key' });
+        if (!has('orders')) d.createObjectStore('orders', { keyPath: 'id' });
       };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
@@ -201,7 +201,7 @@ const LocalDB = {
 };
 
 /* ---------- shared cloud tables: each row = { k, data(jsonb), plate } ---------- */
-const KEYS = { reports: 'id', vehicles: 'plate', employees: 'id', settings: 'key' };
+const KEYS = { reports: 'id', vehicles: 'plate', employees: 'id', settings: 'key', orders: 'id' };
 const Remote = {
   async get(s, k) {
     const { data, error } = await sb.from(s).select('data').eq('k', String(k)).maybeSingle();
@@ -218,7 +218,7 @@ const Remote = {
   },
   async put(s, v) {
     const row = { k: String(v[KEYS[s]]), data: v, updated_at: new Date().toISOString() };
-    if (s === 'reports') row.plate = v.plate;
+    if (s === 'reports' || s === 'orders') row.plate = v.plate || null;
     const up = await sb.from(s).update(row).eq('k', row.k).select('k');
     if (up.error) throw up.error;
     if (up.data && up.data.length) return;
@@ -409,10 +409,45 @@ async function toWav16k(blob) {
   for (let k = 0; k < d.length; k++) { const x = Math.max(-1, Math.min(1, d[k])); v.setInt16(44 + k * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true); }
   return new Blob([wav], { type: 'audio/wav' });
 }
-async function aiTranscribe(blob) {
+async function aiTranscribe(blob, short) {
   let a = blob; try { a = await toWav16k(blob); } catch (e) { console.warn('wav convert failed, sending original', e); }
-  const r = await garageCall({ action: 'transcribe', audio: await toB64(a), mime: (a.type || 'audio/mp4').split(';')[0] });
+  const r = await garageCall({ action: 'transcribe', short: !!short, audio: await toB64(a), mime: (a.type || 'audio/mp4').split(';')[0] });
   return (r.text || '').trim();
+}
+async function aiSku(blob) {
+  const small = await compressImage(blob, 1600, 0.85);
+  return garageCall({ action: 'sku', image: await toB64(small), mime: 'image/jpeg' });
+}
+/* small 🎤 button next to a text field: speak instead of typing (for workers who don't write) */
+function micFor(input, opts = {}) {
+  if (!sb) return input;
+  const btn = h('button', { type: 'button', class: 'btn dict', 'aria-label': 'אמור במקום להקליד' }, ic('mic'));
+  let st = null;
+  const reset = () => { st = null; btn.disabled = false; btn.classList.remove('on'); fill(btn, ic('mic')); };
+  btn.onclick = async () => {
+    if (st) {
+      const s = st; st = null; btn.disabled = true; btn.classList.remove('on'); fill(btn, h('span', { class: 'spin' }));
+      const blob = await new Promise(res => { s.mr.onstop = () => res(new Blob(s.chunks, { type: s.mr.mimeType || 'audio/mp4' })); try { s.mr.stop(); } catch { res(null); } });
+      s.stream.getTracks().forEach(t => t.stop());
+      try {
+        let text = blob && blob.size > 300 ? await aiTranscribe(blob, true) : '';
+        if (opts.numeric) text = (text.replace(/[,\s]/g, '').match(/\d+/) || [''])[0];
+        if (text) { input.value = opts.append && input.value.trim() ? input.value.trim() + ' ' + text : text; input.dispatchEvent(new Event('input', { bubbles: true })); }
+        else toast('לא נשמע דיבור – נסה שוב', 'bad');
+      } catch (e) { console.warn(e); toast('לא הצלחתי לתמלל – נסה שוב או הקלד', 'bad'); }
+      reset(); return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) { alert('הדפדפן לא מאפשר הקלטה כאן. פתח ב-Safari.'); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(m => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || '';
+      const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined), chunks = [];
+      mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      mr.start(500); st = { stream, mr, chunks };
+      btn.classList.add('on'); fill(btn, ic('stop'), ' סיים');
+    } catch (e) { alert('אין גישה למיקרופון. באייפון: הגדרות ← Safari ← מיקרופון ← "אפשר".'); reset(); }
+  };
+  return h('div', { class: 'with-mic' }, input, btn);
 }
 async function aiPlate(blob) {
   const small = await compressImage(blob, 1600, 0.85);
@@ -670,7 +705,7 @@ function reportItem(r, onClick) {
   const allPh = r.entries.reduce((n, e) => n + e.photos.length, 0);
   const text = r.entries.map(e => e.text || e.recordings.map(x => x.transcript).join(' ')).filter(Boolean).join(' · ');
   return h('button', { class: 'item', type: 'button', onclick: onClick || (() => go('#/report/' + r.id)) },
-    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(workTime(r)))),
+    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך'), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(workTime(r)))),
     h('div', { class: 'meta' }, h('span', {}, r.customer || 'ללא שם לקוח'), h('span', {}, fmtTime(workTime(r))), h('span', {}, first.workerName || '')),
     text && h('div', { class: 'snip' }, text),
     h('div', { class: 'counts' },
@@ -684,8 +719,9 @@ async function reportBody(r) {
   const el = h('div');
   const plateImg = await blobURL(r.plateImage);
   el.append(h('div', { class: 'card' },
-    h('div', { class: 'item-top' }, plateBadge(r.plate, true), typeTag(r.type)),
+    h('div', { class: 'item-top' }, plateBadge(r.plate, true), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך')),
     h('dl', { class: 'kv' },
+      r.service === 'rescue' && [h('dt', {}, 'מיקום החילוץ'), h('dd', {}, locLink(r.location) || '—')],
       h('dt', {}, 'לקוח'), h('dd', {}, r.customer || '—'),
       r.type === 'truck' && [h('dt', {}, 'דגם'), h('dd', {}, r.model || '—'), h('dt', {}, 'קילומטרים'), h('dd', {}, r.km ? fmtNum(r.km) : '—')],
       h('dt', {}, 'תאריך העבודה'), h('dd', {}, fmtDT(workTime(r))),
@@ -761,8 +797,13 @@ async function route() {
       if (Date.now() - (+local.get('seenAt', 0)) > 5 * 60e3) { local.set('seenAt', String(Date.now())); sb.rpc('touch_seen').then(() => { }, () => { }); }
     }
     if (!p.length) await viewHome();
-    else if (p[0] === 'new' && (p[1] === 'truck' || p[1] === 'trailer')) await viewNew(p[1], q.get('plate'));
+    else if (p[0] === 'new' && (p[1] === 'truck' || p[1] === 'trailer')) await viewNew(p[1], q.get('plate'), q.get('rescue') === '1');
+    else if (p[0] === 'new' && p[1] === 'rescue') await viewPick(true);
     else if (p[0] === 'new') await viewPick();
+    else if (p[0] === 'orders' && p[1] === 'new') await viewOrderForm(null, q.get('plate'));
+    else if (p[0] === 'orders' && p[1] && p[2] === 'edit') await viewOrderForm(p[1]);
+    else if (p[0] === 'orders' && p[1]) await viewOrder(p[1]);
+    else if (p[0] === 'orders') await viewOrders(q.get('s') || 'open');
     else if (p[0] === 'history') await viewHistory(q.get('q') || '');
     else if (p[0] === 'vehicle') await viewVehicle(decodeURIComponent(p[1] || ''));
     else if (p[0] === 'report' && p[2] === 'add') await viewAdd(p[1]);
@@ -887,12 +928,20 @@ const TRAILER_SVG = `<svg viewBox="0 0 320 190" xmlns="http://www.w3.org/2000/sv
 <g fill="#aab4bf"><circle cx="50" cy="146" r="8.5"/><circle cx="96" cy="146" r="8.5"/><circle cx="142" cy="146" r="8.5"/></g>
 <g fill="#5c6672"><circle cx="50" cy="146" r="3"/><circle cx="96" cy="146" r="3"/><circle cx="142" cy="146" r="3"/></g>
 </svg>`;
-async function vehicleButtons() {
+async function vehicleButtons(rescue) {
   const [ti, ri] = await Promise.all([DB.setting('truckImg'), DB.setting('trailerImg')]);
   const pic = async (id, svg) => { const u = id && await blobURL(id); return u ? h('div', { class: 'pic' }, h('img', { src: u, alt: '' })) : h('div', { class: 'pic', html: svg }); };
+  const q = rescue ? '?rescue=1' : '';
   return h('div', { class: 'vehicles' },
-    h('button', { class: 'vbtn', type: 'button', onclick: () => go('#/new/truck') }, await pic(ti, TRUCK_SVG), h('span', {}, 'משאית')),
-    h('button', { class: 'vbtn', type: 'button', onclick: () => go('#/new/trailer') }, await pic(ri, TRAILER_SVG), h('span', {}, 'נגרר')));
+    h('button', { class: 'vbtn', type: 'button', onclick: () => go('#/new/truck' + q) }, await pic(ti, TRUCK_SVG), h('span', {}, 'משאית')),
+    h('button', { class: 'vbtn', type: 'button', onclick: () => go('#/new/trailer' + q) }, await pic(ri, TRAILER_SVG), h('span', {}, 'נגרר')));
+}
+async function homeExtras() {
+  let open = 0; try { open = (await DB.all('orders')).filter(o => o.status === 'open').length; } catch { }
+  return h('div', { class: 'grid2', style: 'margin-bottom:14px' },
+    h('a', { class: 'btn big', href: '#/new/rescue', style: 'background:var(--danger-soft);color:var(--danger);min-height:76px' }, ic('truck'), 'חילוץ דרך'),
+    h('a', { class: 'btn big', href: '#/orders', style: 'background:#fff3d6;color:#7a5200;min-height:76px;position:relative' }, ic('doc'), 'הזמנת חלקים',
+      open > 0 && h('span', { class: 'badge' }, open)));
 }
 function demoNote() {
   if (sb) return h('div', { class: 'demo-pill', style: 'background:var(--ok-soft);color:var(--ok)' }, ic('check'), h('span', {}, 'שמירה משותפת בענן – כל העובדים רואים את אותן עבודות.'));
@@ -907,6 +956,7 @@ async function viewHome() {
   fill(view,
     nLocal > 0 && moveLocalCard(nLocal),
     h('div', { class: 'card' }, h('h2', { class: 'pick-title' }, 'בחר סוג רכב'), await vehicleButtons()),
+    await homeExtras(),
     h('a', { class: 'btn big dark', href: '#/history', style: 'margin-bottom:14px' }, ic('search'), 'חיפוש היסטוריית טיפולים'),
     demoNote(),
     h('h3', { style: 'margin:6px 2px 10px' }, 'עבודות אחרונות'),
@@ -916,9 +966,9 @@ async function viewHome() {
       sb && me && h('p', { class: 'hint' }, 'מחובר: ', h('b', {}, me.name), me.role === 'admin' ? ' (מנהל)' : '', ' · ',
         h('a', { href: '#', onclick: async e => { e.preventDefault(); if (!confirm('להתנתק מהטלפון הזה?')) return; await sb.auth.signOut(); me = null; route(); } }, 'התנתקות'))));
 }
-async function viewPick() {
-  setHeader('new');
-  fill(view, h('div', { class: 'card' }, h('h2', { class: 'pick-title' }, 'דיווח עבודה חדשה – בחר סוג רכב'), await vehicleButtons()));
+async function viewPick(rescue) {
+  setHeader('new', rescue ? 'חילוץ דרך' : '', rescue ? '#/' : undefined);
+  fill(view, h('div', { class: 'card' }, h('h2', { class: 'pick-title' }, rescue ? 'חילוץ דרך – מה חולץ?' : 'דיווח עבודה חדשה – בחר סוג רכב'), await vehicleButtons(rescue)));
 }
 
 function PlateField(onChange, opts = {}) {
@@ -968,9 +1018,9 @@ function PlateField(onChange, opts = {}) {
   return { el, input, state, recognize, value: () => normPlate(input.value) };
 }
 
-async function viewNew(type, prePlate) {
+async function viewNew(type, prePlate, rescue) {
   const isTruck = type === 'truck';
-  setHeader('new', 'דיווח עבודה חדשה – ' + typeName(type), '#/new');
+  setHeader('new', (rescue ? 'חילוץ דרך – ' : 'דיווח עבודה חדשה – ') + typeName(type), rescue ? '#/new/rescue' : '#/new');
   const vehicles = await DB.all('vehicles');
   const custList = h('datalist', { id: 'custs' }, [...new Set(vehicles.map(v => v.customer).filter(Boolean))].map(c => h('option', { value: c })));
   const customer = h('input', { class: 'input', list: 'custs', placeholder: 'חברה או שם בעל הרכב', autocomplete: 'off' });
@@ -998,8 +1048,9 @@ async function viewNew(type, prePlate) {
         h('button', { type: 'button', class: 'btn sm', onclick: () => showVehicleSheet(p) }, ic('clock'), 'טיפולים קודמים'),
         today && h('button', { type: 'button', class: 'btn sm ok', onclick: () => go('#/report/' + today.id + '/add') }, ic('plus'), 'המשך את הדיווח מהיום')));
   }
-  const comp = Composer(undefined, { onPhoto: b => { if (!plate.value()) plate.recognize(b, true); } });
-  const worker = await WorkerPicker('שם העובד שביצע את העבודה');
+  const comp = Composer(rescue ? 'מה בוצע בחילוץ' : undefined, { onPhoto: b => { if (!plate.value()) plate.recognize(b, true); } });
+  const worker = await WorkerPicker(rescue ? 'מי ביצע את החילוץ' : 'שם העובד שביצע את העבודה');
+  const loc = rescue ? LocationField() : null;
   const wd = WorkDate();
   const when = h('div', { class: 'card' }, wd.el, h('p', { class: 'hint' }, 'אם העבודה נעשתה היום – אין צורך לשנות. זמן ההזנה למערכת נשמר בנפרד אוטומטית.'));
   const iv = 0;
@@ -1007,11 +1058,12 @@ async function viewNew(type, prePlate) {
 
   const vcard = h('div', { class: 'card' },
     h('label', { class: 'lbl' }, 'מספר רישוי ', h('span', { class: 'req' }, '*')), plate.el, known,
-    h('label', { class: 'lbl' }, 'שם הלקוח'), customer, custList,
-    isTruck && [h('label', { class: 'lbl' }, 'דגם המשאית'), model,
+    h('label', { class: 'lbl' }, 'שם הלקוח'), micFor(customer), custList,
+    isTruck && [h('label', { class: 'lbl' }, 'דגם המשאית'), micFor(model),
       h('div', { class: 'chips' }, ['DAF', 'Volvo', 'Scania', 'Mercedes', 'MAN', 'Renault', 'Iveco'].map(m => h('button', { type: 'button', class: 'chip', onclick: () => { model.value = m; } }, m))),
-      h('label', { class: 'lbl' }, 'קילומטרים'), km, kmHint]);
-  fill(view, vcard, comp.el, worker.el, when, saveBtn);
+      h('label', { class: 'lbl' }, 'קילומטרים'), micFor(km, { numeric: true }), kmHint]);
+  fill(view, rescue && h('div', { class: 'demo-pill', style: 'background:var(--danger-soft);color:var(--danger)' }, ic('truck'), h('span', {}, 'דיווח חילוץ דרך')),
+    vcard, loc && loc.el, comp.el, worker.el, when, saveBtn);
   if (prePlate) lookup(normPlate(prePlate));
 
   dirtyCheck = () => !!(plate.value() || customer.value || comp.dirty());
@@ -1034,11 +1086,12 @@ async function viewNew(type, prePlate) {
         createdAt: now, updatedAt: now, createdBy: w.id, createdByName: w.name,
         plateImage: plate.state.image ? await saveBlob(plate.state.image) : null,
         workAt: wd.get(),
+        ...(rescue ? { service: 'rescue', location: loc.get() } : {}),
         entries: [await buildEntry(comp, w, 'work', now, wd.get())],
         log: [{ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'create' }],
       };
       await DB.put('reports', r); await upsertVehicle(r);
-      dirtyCheck = null; toast('העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
+      dirtyCheck = null; toast(rescue ? 'החילוץ נשמר ✓' : 'העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
     } catch (e) {
       console.error(e); alert('השמירה נכשלה: ' + niceErr(e));
       saveBtn.disabled = false; fill(saveBtn, ic('check'), 'שמור עבודה');
@@ -1046,6 +1099,149 @@ async function viewNew(type, prePlate) {
   };
 }
 
+function LocationField(init = {}) {
+  const text = h('input', { class: 'input', placeholder: 'כביש, צומת, עיר או כתובת', value: init.text || '' });
+  let lat = init.lat || null, lng = init.lng || null;
+  const status = h('p', { class: 'hint' });
+  const show = () => fill(status, lat ? h('a', { href: 'https://maps.google.com/?q=' + lat + ',' + lng, target: '_blank' }, '📍 מיקום GPS נשמר – פתח במפה') : '');
+  const gps = h('button', { type: 'button', class: 'btn', style: 'margin-top:10px' }, '📍 המיקום שלי עכשיו');
+  gps.onclick = () => {
+    if (!navigator.geolocation) { alert('הטלפון לא מאפשר מיקום כאן.'); return; }
+    fill(status, h('span', { class: 'spin' }), ' מאתר מיקום…');
+    navigator.geolocation.getCurrentPosition(p => { lat = +p.coords.latitude.toFixed(6); lng = +p.coords.longitude.toFixed(6); show(); },
+      () => { fill(status, 'לא הצלחתי לקבל מיקום. באייפון: הגדרות ← פרטיות ← שירותי מיקום ← Safari. אפשר לכתוב את המקום.'); },
+      { enableHighAccuracy: true, timeout: 15000 });
+  };
+  show();
+  return { el: h('div', { class: 'card' }, h('h3', {}, 'מיקום החילוץ'), micFor(text), gps, status),
+    get: () => ({ text: text.value.trim(), lat, lng }) };
+}
+const locLink = l => l && (l.lat ? h('a', { href: 'https://maps.google.com/?q=' + l.lat + ',' + l.lng, target: '_blank' }, (l.text || 'פתח במפה') + ' 📍') : (l.text || null));
+/* ---------- parts orders ---------- */
+const ORDER_STATUS = { open: 'ממתינה להזמנה', ordered: 'הוזמנה', received: 'התקבלה', cancelled: 'בוטלה' };
+const statusTag = st => h('span', { class: 'tag st-' + st }, ORDER_STATUS[st] || st);
+const canEditOrder = o => isAdmin() || (o.workerId === myEid() && o.status === 'open');
+function orderItem(o, thumb) {
+  return h('button', { class: 'item', type: 'button', onclick: () => go('#/orders/' + o.id) },
+    h('div', { class: 'item-top' },
+      thumb ? h('img', { src: thumb, alt: '', style: 'width:54px;height:54px;object-fit:cover;border-radius:10px' }) : null,
+      h('div', { class: 'grow' }, h('b', { dir: 'ltr', style: 'font-size:17px' }, o.sku || '(ללא מק״ט)'), ' ', h('span', {}, o.partName || '')),
+      h('b', { style: 'font-size:20px' }, '×' + (o.qty || 1))),
+    h('div', { class: 'meta' }, statusTag(o.status), o.urgent && h('span', { class: 'tag rescue' }, 'דחוף'),
+      o.plate && plateBadge(o.plate), h('span', {}, o.workerName || ''), h('span', {}, fmtDT(o.createdAt))),
+    o.note && h('div', { class: 'snip' }, o.note));
+}
+async function viewOrders(filter) {
+  setHeader('', 'הזמנת חלקים', '#/');
+  const all = (await DB.all('orders')).sort((a, b) => (b.urgent - a.urgent) || b.createdAt - a.createdAt);
+  const list = filter === 'all' ? all : all.filter(o => o.status === filter);
+  const thumbs = await Promise.all(list.map(o => (o.photos && o.photos[0] ? blobURL(o.photos[0]) : null)));
+  const tabs = [['open', 'ממתינות'], ['ordered', 'הוזמנו'], ['received', 'התקבלו'], ['all', 'הכול']];
+  fill(view,
+    h('a', { class: 'btn big ok', href: '#/orders/new', style: 'margin-bottom:14px' }, ic('plus'), 'הזמנה חדשה'),
+    h('div', { class: 'subtabs' }, tabs.map(([k, l]) => h('a', { href: '#/orders?s=' + k, class: filter === k ? 'on' : '' }, l + ' (' + (k === 'all' ? all.length : all.filter(o => o.status === k).length) + ')'))),
+    list.length ? list.map((o, i) => orderItem(o, thumbs[i])) : h('div', { class: 'empty' }, 'אין הזמנות כאן.'));
+}
+async function viewOrderForm(id, prePlate) {
+  const old = id ? await DB.get('orders', id) : null;
+  if (id && !old) { fill(view, h('div', { class: 'empty' }, 'ההזמנה לא נמצאה')); return; }
+  if (old && !canEditOrder(old)) { toast('אפשר לשנות רק הזמנה שלך שעוד לא הוזמנה', 'bad'); go('#/orders/' + id); return; }
+  setHeader('', old ? 'עריכת הזמנה' : 'הזמנת חלק חדשה', old ? '#/orders/' + id : '#/orders');
+  const sku = h('input', { class: 'input', dir: 'ltr', placeholder: 'מק״ט / מספר חלק', value: old ? old.sku : '', autocomplete: 'off', autocapitalize: 'characters' });
+  const partName = h('input', { class: 'input', placeholder: 'מה החלק? למשל: כרית אוויר אחורית', value: old ? old.partName : '' });
+  const qty = h('input', { class: 'input', inputmode: 'numeric', value: old ? String(old.qty) : '1', style: 'text-align:center;font-size:24px;font-weight:800' });
+  const step = d => { qty.value = String(Math.max(1, (parseInt(qty.value, 10) || 1) + d)); };
+  const plate = h('input', { class: 'input plate-in', inputmode: 'numeric', placeholder: 'לא חובה', value: old && old.plate ? fmtPlate(old.plate) : prePlate ? fmtPlate(prePlate) : '' });
+  plate.addEventListener('blur', () => { if (normPlate(plate.value)) plate.value = fmtPlate(plate.value); });
+  const note = h('textarea', { class: 'input', rows: 3, placeholder: 'הערות: ספק, צבע, מידה, למי…', value: old ? old.note : '' });
+  const urgent = h('input', { type: 'checkbox', style: 'width:24px;height:24px' }); urgent.checked = !!(old && old.urgent);
+  const skuStatus = h('div', { class: 'ocr-status', hidden: true });
+  const readSku = async blob => {
+    if (!aiOn()) return;
+    skuStatus.hidden = false; skuStatus.className = 'ocr-status'; fill(skuStatus, h('span', { class: 'spin' }), ' קורא את המק״ט מהתמונה…');
+    try {
+      const r = await aiSku(blob);
+      if (r.sku && !sku.value.trim()) sku.value = r.sku;
+      if (r.name && !partName.value.trim()) partName.value = r.name + (r.brand ? ' (' + r.brand + ')' : '');
+      skuStatus.className = r.sku ? 'ocr-status ok' : 'ocr-status bad';
+      skuStatus.textContent = r.sku ? '✓ זוהה מק״ט: ' + r.sku + ' – בדוק שהוא נכון.' : 'לא מצאתי מק״ט בתמונה. אפשר להקליד, או לצלם את התווית מקרוב.';
+    } catch (e) { skuStatus.className = 'ocr-status bad'; skuStatus.textContent = 'קריאת המק״ט לא זמינה כרגע – הקלד ידנית.'; }
+  };
+  const ph = Photos(b => readSku(b));
+  const oldPhotos = old ? (await Promise.all((old.photos || []).map(blobURL))).filter(Boolean) : [];
+  const worker = await WorkerPicker('מי מזמין');
+  const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), old ? 'שמור שינויים' : 'שלח הזמנה');
+  fill(view,
+    h('div', { class: 'card' }, h('h3', {}, 'תמונה של החלק או של המק״ט'),
+      h('p', { class: 'hint', style: 'margin-top:0' }, 'צלם את התווית עם המספר – המק״ט ייקרא אוטומטית.'),
+      oldPhotos.length ? photoGrid(oldPhotos) : null, ph.el, skuStatus),
+    h('div', { class: 'card' },
+      h('label', { class: 'lbl' }, 'מק״ט'), sku,
+      h('label', { class: 'lbl' }, 'שם החלק'), micFor(partName),
+      h('label', { class: 'lbl' }, 'כמות להזמין'),
+      h('div', { class: 'with-mic' }, h('button', { type: 'button', class: 'btn', style: 'min-width:56px;font-size:26px', onclick: () => step(-1) }, '−'), qty,
+        h('button', { type: 'button', class: 'btn', style: 'min-width:56px;font-size:26px', onclick: () => step(1) }, '+')),
+      sb && h('div', { style: 'margin-top:8px' }, micFor(h('input', { class: 'input', placeholder: 'או אמור את הכמות', oninput: e => { const n = parseInt(e.target.value, 10); if (n > 0) qty.value = String(n); } }), { numeric: true })),
+      h('label', { class: 'lbl' }, 'לאיזה רכב (לא חובה)'), plate,
+      h('label', { class: 'lbl' }, 'הערות'), micFor(note, { append: true }),
+      h('label', { style: 'display:flex;gap:10px;align-items:center;font-weight:700;margin-top:14px' }, urgent, 'דחוף')),
+    worker.el, saveBtn);
+  dirtyCheck = () => !old && !!(sku.value.trim() || partName.value.trim() || ph.list.length || note.value.trim());
+  saveBtn.onclick = async () => {
+    if (!sku.value.trim() && !partName.value.trim() && !ph.list.length && !(old && old.photos && old.photos.length)) { alert('צלם את החלק, או כתוב מק״ט או שם חלק.'); return; }
+    const n = parseInt(qty.value, 10); if (!(n > 0)) { alert('הכנס כמות.'); return; }
+    const w = worker.get(); if (!w) { alert('בחר את השם שלך.'); return; }
+    saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
+    try {
+      const now = Date.now(), photos = [];
+      for (const p of ph.list) photos.push(await saveBlob(p.blob));
+      const o = old ? { ...old } : { id: uid(), createdAt: now, status: 'open', workerId: w.id, workerName: w.name, ...actor(), photos: [], statusLog: [{ at: now, status: 'open', byName: (me && me.name) || w.name }] };
+      Object.assign(o, { sku: sku.value.trim(), partName: partName.value.trim(), qty: n, plate: normPlate(plate.value) || null, note: note.value.trim(), urgent: urgent.checked, updatedAt: now });
+      o.photos = [...(o.photos || []), ...photos];
+      await DB.put('orders', o);
+      dirtyCheck = null; toast(old ? 'ההזמנה עודכנה ✓' : 'ההזמנה נשלחה ✓', 'ok'); go('#/orders/' + o.id);
+    } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); saveBtn.disabled = false; fill(saveBtn, ic('check'), old ? 'שמור שינויים' : 'שלח הזמנה'); }
+  };
+}
+async function viewOrder(id) {
+  const o = await DB.get('orders', id);
+  if (!o) { setHeader('', 'הזמנה', '#/orders'); fill(view, h('div', { class: 'empty' }, 'ההזמנה לא נמצאה')); return; }
+  setHeader('', 'הזמנה ' + (o.sku || ''), '#/orders');
+  const urls = (await Promise.all((o.photos || []).map(blobURL))).filter(Boolean);
+  const setStatus = async st => {
+    try {
+      const f = await DB.get('orders', id);
+      f.status = st; f.updatedAt = Date.now();
+      f.statusLog = [...(f.statusLog || []), { at: Date.now(), status: st, byName: (me && me.name) || '' }];
+      await DB.put('orders', f); toast('עודכן: ' + ORDER_STATUS[st], 'ok'); route();
+    } catch (e) { alert(niceErr(e)); }
+  };
+  fill(view,
+    h('div', { class: 'card' },
+      h('div', { class: 'item-top' }, h('b', { dir: 'ltr', style: 'font-size:22px' }, o.sku || '(ללא מק״ט)'), h('span', { class: 'grow' }), statusTag(o.status), o.urgent && h('span', { class: 'tag rescue' }, 'דחוף')),
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'חלק'), h('dd', {}, o.partName || '—'),
+        h('dt', {}, 'כמות'), h('dd', { style: 'font-size:20px' }, '×' + o.qty),
+        h('dt', {}, 'רכב'), h('dd', {}, o.plate ? h('a', { href: '#/vehicle/' + o.plate }, plateBadge(o.plate)) : '—'),
+        h('dt', {}, 'הוזמן ע״י'), h('dd', {}, (o.workerName || '') + byNote(o)),
+        h('dt', {}, 'נפתח'), h('dd', {}, fmtDT(o.createdAt))),
+      o.note && h('p', { class: 'entry-text' }, o.note),
+      urls.length ? h('div', { style: 'margin-top:10px' }, photoGrid(urls)) : null),
+    isAdmin() && h('div', { class: 'card' }, h('h3', {}, 'עדכון סטטוס (מנהל)'),
+      h('div', { class: 'row' },
+        o.status !== 'ordered' && h('button', { type: 'button', class: 'btn primary', onclick: () => setStatus('ordered') }, 'סמן: הוזמנה'),
+        o.status !== 'received' && h('button', { type: 'button', class: 'btn ok', onclick: () => setStatus('received') }, 'סמן: התקבלה'),
+        o.status !== 'open' && h('button', { type: 'button', class: 'btn', onclick: () => setStatus('open') }, 'החזר לממתינה'),
+        o.status !== 'cancelled' && h('button', { type: 'button', class: 'btn danger', onclick: () => setStatus('cancelled') }, 'בטל'))),
+    canEditOrder(o) && h('div', { class: 'row', style: 'margin-bottom:14px' },
+      h('a', { class: 'btn', href: '#/orders/' + id + '/edit' }, ic('edit'), 'ערוך הזמנה'),
+      !isAdmin() && h('button', { type: 'button', class: 'btn danger', onclick: () => { if (confirm('לבטל את ההזמנה?')) setStatus('cancelled'); } }, 'בטל הזמנה')),
+    h('div', { class: 'card' }, h('h3', {}, 'היסטוריה'), h('ul', { class: 'log' }, (o.statusLog || []).slice().reverse().map(l => h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', ORDER_STATUS[l.status] || l.status, l.byName ? ' · ' + l.byName : '')))),
+    isAdmin() && sb && h('button', { type: 'button', class: 'btn wide danger', onclick: async () => {
+      if (!confirm('למחוק את ההזמנה לגמרי?')) return;
+      try { await DB.del('orders', id); for (const b of o.photos || []) { try { await Blobs.del(b); } catch { } } toast('נמחקה', 'ok'); go('#/orders'); } catch (e) { alert(niceErr(e)); }
+    } }, ic('trash'), 'מחק הזמנה (מנהל)'));
+}
 async function showVehicleSheet(plate) {
   const reps = (await DB.byPlate(plate)).sort((a, b) => workTime(b) - workTime(a));
   const s = openSheet('טיפולים קודמים – ' + fmtPlate(plate), h('div'));
@@ -1113,6 +1309,7 @@ async function viewReport(id) {
       : h('p', { class: 'hint', style: 'margin:0 0 14px' }, 'אפשר להוסיף עבודה לדיווח הזה. תיקון של עבודה שרשם עובד אחר – רק מנהל.'),
     await reportBody(r),
     h('a', { class: 'btn wide', href: '#/vehicle/' + r.plate }, ic('clock'), 'כל הטיפולים של הרכב הזה'),
+    sb && h('a', { class: 'btn wide', href: '#/orders/new?plate=' + r.plate, style: 'margin-top:10px;background:#fff3d6;color:#7a5200' }, ic('doc'), 'הזמן חלק לרכב הזה'),
     isAdmin() && sb && h('button', { type: 'button', class: 'btn wide danger', style: 'margin-top:10px', onclick: async () => {
       if (!confirm('למחוק את כל הדיווח של ' + fmtPlate(r.plate) + ' מ-' + fmtDate(r.createdAt) + '?\nכולל ההקלטות והתמונות. אי אפשר לבטל.')) return;
       try {
@@ -1191,7 +1388,7 @@ async function viewEdit(id) {
     !isAdmin() && h('p', { class: 'hint', style: 'margin:0 0 12px' }, 'אפשר לתקן רק את מה שאתה רשמת. החלקים האפורים נרשמו ע״י אחרים – תיקון שלהם רק אצל מנהל.'),
     h('div', { class: 'card' }, h('h3', {}, 'פרטי הרכב'),
       !headOk && h('p', { class: 'hint', style: 'margin-top:0' }, 'נפתח ע״י ' + (r.createdByName || 'עובד אחר') + ' – רק הוא או מנהל יכולים לשנות.'),
-      h('label', { class: 'lbl' }, 'מספר רישוי'), f.plate, h('label', { class: 'lbl' }, 'שם הלקוח'), f.customer,
+      h('label', { class: 'lbl' }, 'מספר רישוי'), f.plate, h('label', { class: 'lbl' }, 'שם הלקוח'), headOk ? micFor(f.customer) : f.customer,
       isTruck && [h('label', { class: 'lbl' }, 'דגם'), f.model, h('label', { class: 'lbl' }, 'קילומטרים'), f.km]),
     entryFields.map((x, i) => {
       const card = h('div', { class: 'card', style: x.ok ? '' : 'opacity:.6' }, h('h3', {}, x.label + ' · ' + fmtDT(x.e.at) + ' · ' + x.e.workerName),
@@ -1301,12 +1498,14 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
     .map(r => ({ r, entries: r.entries.filter(e => workTime(e) >= from && workTime(e) <= to) }))
     .filter(x => x.entries.length)
     .sort((a, b) => workTime(a.entries[0]) - workTime(b.entries[0]));
-  if (!reports.length) { fill(status, 'אין עבודות בין התאריכים האלה.'); return; }
+  let orders = [];
+  try { orders = (await DB.all('orders')).filter(o => o.createdAt >= from && o.createdAt <= to).sort((a, b) => a.createdAt - b.createdAt); } catch { }
+  if (!reports.length && !orders.length) { fill(status, 'אין עבודות או הזמנות בין התאריכים האלה.'); return; }
   const files = [];   // { path, id }
   const rows = [], viewer = [];
   for (const { r, entries } of reports) {
     const folder = 'jobs/' + ymd(workTime(entries[0])) + '_' + r.plate + '_' + r.id.slice(0, 6) + '/';
-    const vjob = { plate: fmtPlate(r.plate), type: typeName(r.type), customer: r.customer || '', model: r.model || '', km: r.km || '', folder, entries: [], platePhoto: null };
+    const vjob = { rescue: r.service === 'rescue', where: r.location ? r.location.text || '' : '', plate: fmtPlate(r.plate), type: typeName(r.type), customer: r.customer || '', model: r.model || '', km: r.km || '', folder, entries: [], platePhoto: null };
     if (r.plateImage) { vjob.platePhoto = folder + 'plate.jpg'; files.push({ path: vjob.platePhoto, id: r.plateImage }); }
     entries.forEach((e, n) => {
       const i = r.entries.indexOf(e);
@@ -1316,6 +1515,7 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
       const recs = e.recordings.map((rc, k) => { const path = folder + tag + '-recording-' + (k + 1) + '.' + extOf(rc.mime || ''); files.push({ path, id: rc.blobId }); return { path, transcript: rc.transcript || '' }; });
       rows.push({
         'תאריך העבודה': ymd(workTime(e)), 'שעה': fmtTime(workTime(e)), 'נרשם במערכת': fmtDT(e.at),
+        'שירות': r.service === 'rescue' ? 'חילוץ דרך' : 'עבודה במוסך', 'מיקום': r.service === 'rescue' && r.location ? [r.location.text, r.location.lat ? 'https://maps.google.com/?q=' + r.location.lat + ',' + r.location.lng : ''].filter(Boolean).join(' ') : '',
         'מספר רישוי': fmtPlate(r.plate), 'סוג': typeName(r.type), 'לקוח': r.customer || '', 'דגם': r.model || '', 'ק״מ': r.km || '',
         'עובד': e.workerName || '', 'הוזן ע״י': e.byName && e.byName !== e.workerName ? e.byName : '', 'סוג קטע': kind,
         'מה בוצע (טקסט)': e.text || '', 'תמלול הקלטות': recs.map(x => x.transcript).filter(Boolean).join(' | '),
@@ -1325,6 +1525,14 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
     });
     viewer.push(vjob);
   }
+  const orderRows = orders.map(o => {
+    const photos = (o.photos || []).map((id, k) => { const path = 'orders/' + ymd(o.createdAt) + '_' + (o.sku || 'part').replace(/[^\w.-]+/g, '_').slice(0, 30) + '_' + o.id.slice(0, 6) + '-' + (k + 1) + '.jpg'; files.push({ path, id }); return path; });
+    o._photos = photos;
+    return { 'תאריך': fmtDT(o.createdAt), 'מק״ט': o.sku || '', 'חלק': o.partName || '', 'כמות': o.qty || 1, 'דחוף': o.urgent ? 'כן' : '',
+      'רכב': o.plate ? fmtPlate(o.plate) : '', 'הוזמן ע״י': o.workerName || '', 'סטטוס': ORDER_STATUS[o.status] || o.status,
+      'עדכון סטטוס': (o.statusLog || []).map(l => fmtDT(l.at) + ' ' + (ORDER_STATUS[l.status] || l.status) + (l.byName ? ' (' + l.byName + ')' : '')).join(' | '),
+      'הערות': o.note || '', 'תמונות': photos.join(' ') };
+  });
   if (files.length > 400 && !confirm('יש ' + files.length + ' קבצים (תמונות והקלטות). ההורדה עלולה לקחת כמה דקות. להמשיך?')) { fill(status, 'בוטל.'); return; }
   const zip = new JSZip();
   // photos and recordings (already compressed → stored as-is)
@@ -1342,9 +1550,9 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
   say('בונה קובץ Excel…');
   const wb = XLSX.utils.book_new();
   wb.Workbook = { Views: [{ RTL: true }] };
-  const ws = XLSX.utils.json_to_sheet(rows);
-  ws['!cols'] = [12, 7, 16, 12, 8, 18, 12, 9, 14, 14, 11, 50, 50, 7, 7, 34].map(w => ({ wch: w }));
-  rows.forEach((row, i) => { const c = XLSX.utils.encode_cell({ r: i + 1, c: 15 }); if (ws[c]) ws[c].l = { Target: row['תיקייה'], Tooltip: 'פתח תיקייה' }; });
+  const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'תאריך העבודה': '', 'מה בוצע (טקסט)': 'אין עבודות בתקופה' }]);
+  ws['!cols'] = [12, 7, 16, 12, 24, 12, 8, 18, 12, 9, 14, 14, 11, 50, 50, 7, 7, 34].map(w => ({ wch: w }));
+  rows.forEach((row, i) => { const c = XLSX.utils.encode_cell({ r: i + 1, c: 17 }); if (ws[c]) ws[c].l = { Target: row['תיקייה'], Tooltip: 'פתח תיקייה' }; });
   XLSX.utils.book_append_sheet(wb, ws, 'עבודות');
   const plates = [...new Set(reports.map(x => x.r.plate))];
   const vehicles = (await DB.all('vehicles')).filter(v => plates.includes(v.plate)).map(v => ({
@@ -1359,22 +1567,26 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
     'פרטים': (l.changes || []).map(c => c.field + ': "' + (c.from || '') + '" ← "' + (c.to || '') + '"').join(' | ') });
   const wc = XLSX.utils.json_to_sheet(changes.length ? changes : [{ 'מתי': '', 'פרטים': 'אין שינויים בתקופה' }]); wc['!cols'] = [16, 12, 14, 14, 10, 80].map(w => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, wc, 'שינויים');
+  const wo = XLSX.utils.json_to_sheet(orderRows.length ? orderRows : [{ 'תאריך': '', 'הערות': 'אין הזמנות בתקופה' }]);
+  wo['!cols'] = [16, 18, 26, 6, 6, 12, 14, 14, 60, 40, 40].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, wo, 'הזמנות חלקים');
   zip.file('עבודות.xlsx', XLSX.write(wb, { bookType: 'xlsx', type: 'array' }));
   // offline viewer page
-  zip.file('פתח-אותי.html', offlinePage(viewer, fromTxt, toTxt));
+  zip.file('פתח-אותי.html', offlinePage(viewer, fromTxt, toTxt, orders));
   say('אורז קובץ ZIP…');
   const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } }, m => say('אורז ' + Math.round(m.percent) + '%…'));
   const name = 'מוסך-טארק_' + fromTxt + '_עד_' + toTxt + '.zip';
   const file = new File([blob], name, { type: 'application/zip' });
-  fill(status, '✓ מוכן: ' + rows.length + ' עבודות, ' + (files.length - missing) + ' קבצים' + (missing ? ' (' + missing + ' קבצים לא נמצאו)' : '') + ' · ' + (blob.size / 1048576).toFixed(1) + ' MB');
+  fill(status, '✓ מוכן: ' + rows.length + ' עבודות, ' + orders.length + ' הזמנות, ' + (files.length - missing) + ' קבצים' + (missing ? ' (' + missing + ' קבצים לא נמצאו)' : '') + ' · ' + (blob.size / 1048576).toFixed(1) + ' MB');
   const a = h('a', { href: URL.createObjectURL(file), download: name }); document.body.append(a); a.click(); a.remove();
   if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], title: name }); } catch { }
   }
 }
-function offlinePage(jobs, fromTxt, toTxt) {
+function offlinePage(jobs, fromTxt, toTxt, orders = []) {
   const card = j => `<section class="job" data-s="${esc((j.plate + ' ' + j.customer + ' ' + j.model + ' ' + j.entries.map(e => e.worker + ' ' + e.text + ' ' + e.recs.map(r => r.transcript).join(' ')).join(' ')).toLowerCase())}">
-  <h2><span class="plate">${esc(j.plate)}</span> ${esc(j.type)} · ${esc(j.customer || 'ללא שם לקוח')}${j.model ? ' · ' + esc(j.model) : ''}${j.km ? ' · ' + esc(j.km) + ' ק״מ' : ''}</h2>
+  <h2>${j.rescue ? '<span class="res">חילוץ דרך</span> ' : ''}<span class="plate">${esc(j.plate)}</span> ${esc(j.type)} · ${esc(j.customer || 'ללא שם לקוח')}${j.model ? ' · ' + esc(j.model) : ''}${j.km ? ' · ' + esc(j.km) + ' ק״מ' : ''}</h2>
+  ${j.rescue && j.where ? `<div class="m">מיקום: ${esc(j.where)}</div>` : ''}
   ${j.platePhoto ? `<a href="${esc(j.platePhoto)}"><img class="pp" src="${esc(j.platePhoto)}" alt=""></a>` : ''}
   ${j.entries.map(e => `<div class="e"><b>${esc(e.kind)}</b> · בוצע ${esc(e.date)} · ${esc(e.worker)}${e.by ? ' (הוזן ע״י ' + esc(e.by) + ')' : ''} <span class="m">נרשם ${esc(e.entered)}</span>
     ${e.text ? `<p>${esc(e.text)}</p>` : ''}
@@ -1391,11 +1603,18 @@ input{width:100%;font-size:17px;padding:10px;border:2px solid #cfd8e3;border-rad
 h2{font-size:18px;margin:0 0 8px}.plate{background:#ffcd00;border:2px solid #111;border-radius:5px;padding:1px 8px;direction:ltr;display:inline-block;font-weight:800}
 .e{border-right:4px solid #14529e;padding:6px 10px;margin:10px 0}.m{color:#5b6b80;font-size:13px}
 p{white-space:pre-wrap;margin:6px 0}.r{background:#f4f7fb;border-radius:8px;padding:6px 8px;margin:6px 0}audio{width:100%;max-width:420px}
+.res{background:#fdecea;color:#c62f22;border-radius:6px;padding:1px 8px;font-size:14px}.ord{border-right:4px solid #f5b400}
 .ph{display:flex;flex-wrap:wrap;gap:6px}.ph img{width:120px;height:120px;object-fit:cover;border-radius:8px}.pp{height:70px;border-radius:6px}
 </style></head><body><div class="top"><h1>מוסך טארק ת.ד בע״מ – עבודות ${esc(fromTxt)} עד ${esc(toTxt)}</h1>
 <div class="m">${jobs.length} דיווחים · נוצר ${esc(fmtDT(Date.now()))} · עובד גם בלי אינטרנט</div>
 <input id="q" placeholder="חיפוש: מספר רישוי, לקוח, עובד, מילה מהעבודה"></div>
 ${jobs.map(card).join('\n')}
+${orders.length ? `<h1 style="margin-top:24px">הזמנות חלקים (${orders.length})</h1>` + orders.map(o => `<section class="job ord" data-s="${esc(((o.sku || '') + ' ' + (o.partName || '') + ' ' + (o.plate || '') + ' ' + (o.workerName || '') + ' ' + (o.note || '')).toLowerCase())}">
+  <h2 dir="auto">${esc(o.sku || '(ללא מק״ט)')} · ${esc(o.partName || '')} · ×${esc(o.qty)}</h2>
+  <div class="m">${esc(ORDER_STATUS[o.status] || o.status)}${o.urgent ? ' · דחוף' : ''} · ${esc(fmtDT(o.createdAt))} · ${esc(o.workerName || '')}${o.plate ? ' · רכב ' + esc(fmtPlate(o.plate)) : ''}</div>
+  ${o.note ? `<p>${esc(o.note)}</p>` : ''}
+  ${(o._photos || []).length ? `<div class="ph">${o._photos.map(p => `<a href="${esc(p)}" target="_blank"><img src="${esc(p)}" loading="lazy" alt=""></a>`).join('')}</div>` : ''}
+</section>`).join('\n') : ''}
 <script>document.getElementById('q').oninput=function(){var v=this.value.trim().toLowerCase().replace(/-/g,'');document.querySelectorAll('.job').forEach(function(s){s.style.display=!v||s.dataset.s.replace(/-/g,'').indexOf(v)>=0?'':'none'})}</script>
 </body></html>`;
 }
@@ -1407,14 +1626,16 @@ async function adminWorks(body) {
     cust: h('input', { class: 'input', placeholder: 'שם לקוח' }),
     worker: h('select', { class: 'input' }, h('option', { value: '' }, 'כל העובדים'), emps.map(e => h('option', { value: e.id }, e.name))),
     type: h('select', { class: 'input' }, h('option', { value: '' }, 'משאיות ונגררים'), h('option', { value: 'truck' }, 'משאיות'), h('option', { value: 'trailer' }, 'נגררים')),
+    service: h('select', { class: 'input' }, h('option', { value: '' }, 'עבודות וחילוצים'), h('option', { value: 'work' }, 'עבודות מוסך'), h('option', { value: 'rescue' }, 'חילוצי דרך')),
     from: h('input', { class: 'input', type: 'date' }), to: h('input', { class: 'input', type: 'date' }),
   };
   const out = h('div');
   const run = () => {
-    const pd = normPlate(f.plate.value), c = f.cust.value.trim(), w = f.worker.value, t = f.type.value;
+    const pd = normPlate(f.plate.value), c = f.cust.value.trim(), w = f.worker.value, t = f.type.value, sv = f.service.value;
     const from = f.from.value ? new Date(f.from.value + 'T00:00').getTime() : 0;
     const to = f.to.value ? new Date(f.to.value + 'T23:59:59').getTime() : Infinity;
     const res = reps.filter(r => (!pd || r.plate.includes(pd)) && (!c || (r.customer || '').includes(c)) && (!t || r.type === t) &&
+      (!sv || (sv === 'rescue') === (r.service === 'rescue')) &&
       (!w || r.entries.some(e => e.workerId === w)) && r.entries.some(e => workTime(e) >= from && workTime(e) <= to));
     fill(out, h('h3', { style: 'margin:6px 2px 10px' }, 'נמצאו ' + res.length + ' עבודות'), res.length ? res.map(r => reportItem(r)) : h('div', { class: 'empty' }, 'אין תוצאות'));
   };
@@ -1425,7 +1646,7 @@ async function adminWorks(body) {
     exportCard(),
     h('div', { class: 'stats' }, h('div', { class: 'stat' }, h('b', {}, today), h('span', {}, 'היום')), h('div', { class: 'stat' }, h('b', {}, week), h('span', {}, '7 ימים')), h('div', { class: 'stat' }, h('b', {}, reps.length), h('span', {}, 'סה״כ'))),
     h('div', { class: 'card' }, h('h3', {}, 'חיפוש עבודות'),
-      h('div', { class: 'grid2' }, f.plate, f.cust, f.worker, f.type),
+      h('div', { class: 'grid2' }, f.plate, f.cust, f.worker, f.type, f.service),
       h('div', { class: 'grid2', style: 'margin-top:12px' }, h('div', {}, h('label', { class: 'lbl' }, 'מתאריך'), f.from), h('div', {}, h('label', { class: 'lbl' }, 'עד תאריך'), f.to)),
       h('button', { type: 'button', class: 'btn sm', style: 'margin-top:12px', onclick: () => { Object.values(f).forEach(x => { x.value = ''; }); run(); } }, 'נקה סינון')),
     out);

@@ -66,6 +66,15 @@ const TRANSCRIBE_PROMPT = `תמלל את ההקלטה המצורפת לעברי�
 שמות יצרנים ודגמים (DAF, Volvo, Scania, Mercedes, MAN, Renault, Iveco, Wabco, Knorr) כתוב באותיות לטיניות. מספרים כתוב בספרות.
 החזר רק את הטקסט המתומלל, בלי הקדמה, בלי הסברים ובלי מירכאות. אם אין דיבור, החזר מחרוזת ריקה.`;
 
+const SHORT_PROMPT = `תמלל את ההקלטה הקצרה המצורפת. זו מילה או כמה מילים בודדות: שם של לקוח, שם של חברה, דגם של משאית, כתובת או מספר.
+כתוב שמות של חברות ודגמים לועזיים (DAF, Volvo, Scania, Mercedes, MAN) באותיות לטיניות, ומספרים בספרות.
+החזר רק את הטקסט עצמו, בלי נקודה בסוף, בלי מירכאות ובלי הסברים. אם אין דיבור, החזר מחרוזת ריקה.`;
+
+const SKU_PROMPT = `This photo shows a truck/trailer spare part, its box, or its label.
+Read the part number (catalog number / SKU / OE number / מק"ט) printed on it. Prefer the manufacturer part number; if several numbers appear, choose the one most likely to be the part number (not a barcode digit string, date, or batch number).
+Also give a short Hebrew name of the part if you can tell what it is, and the brand if printed.
+Answer as JSON: {"sku": "<part number exactly as printed, empty if none>", "name": "<short Hebrew part name or empty>", "brand": "<brand or empty>"}`;
+
 const PLATE_PROMPT = `In this photo there is a vehicle (truck, tractor unit or trailer) in Israel, or a close-up of its license plate.
 Find the vehicle's Israeli license plate and read its number.
 Israeli plates: yellow background, black digits, usually 7 digits (NN-NNN-NN) or 8 digits (NNN-NN-NNN); old or trailer plates may have 5-6 digits.
@@ -97,7 +106,7 @@ Deno.serve(async (req) => {
         if (!body.audio) return json({ error: 'no_audio' }, 400);
         const t0 = Date.now();
         try {
-          const { text, model } = await gemini([{ text: TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]);
+          const { text, model } = await gemini([{ text: body.short ? SHORT_PROMPT : TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]);
           await log('transcribe', true, model, t0, null);
           return json({ text, model });
         } catch (e) { await log('transcribe', false, null, t0, String((e as Error).message || e)); throw e; }
@@ -114,6 +123,16 @@ Deno.serve(async (req) => {
         try { p = JSON.parse(out); } catch { p = { plate: (out.match(/\d{5,8}/) || [''])[0] }; }
         const plate = String(p.plate || '').replace(/\D/g, '');
         return json({ plate: plate.length >= 5 && plate.length <= 8 ? plate : '', confidence: p.confidence || 'low', model });
+      }
+      case 'sku': {
+        if (!body.image) return json({ error: 'no_image' }, 400);
+        const t0 = Date.now();
+        try {
+          const { text: out, model } = await gemini([{ text: SKU_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true);
+          await log('sku', true, model, t0, 'answer: ' + out.slice(0, 120));
+          let p: any = {}; try { p = JSON.parse(out); } catch { }
+          return json({ sku: String(p.sku || '').trim(), name: String(p.name || '').trim(), brand: String(p.brand || '').trim(), model });
+        } catch (e) { await log('sku', false, null, t0, String((e as Error).message || e)); throw e; }
       }
       case 'whoami':
         return json({ profile: me });
