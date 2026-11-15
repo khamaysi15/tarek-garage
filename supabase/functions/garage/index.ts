@@ -90,9 +90,7 @@ const ilDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusale
 const ilClock = () => new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
 const ilWeekday = () => new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Jerusalem', weekday: 'short' }).format(new Date());
 async function sendFoodReminders(db: any, onlyMissing = true) {
-  const pub = Deno.env.get('VAPID_PUBLIC'), priv = Deno.env.get('VAPID_PRIVATE');
-  if (!pub || !priv) throw new Error('push_not_set_up');
-  webpush.setVapidDetails(Deno.env.get('VAPID_SUBJECT') || 'https://khamaysi15.github.io/tarek-garage/', pub, priv);
+  vapid();
   const today = ilDate();
   const { data: profs } = await db.from('profiles').select('user_id, employee_id, active');
   const { data: meals } = await db.from('meals').select('data').like('k', today + '_%');
@@ -101,11 +99,20 @@ async function sendFoodReminders(db: any, onlyMissing = true) {
   if (!targets.length) return { sent: 0, people: 0 };
   const { data: subs } = await db.from('push_subs').select('*').in('user_id', targets);
   const payload = JSON.stringify({ title: '🍽️ הזמנת אוכל', body: 'עוד לא בחרת אוכל להיום – ההזמנה נסגרת ב-12:00', url: './#/', tag: 'food-' + today });
+  return await pushTo(db, subs || [], payload);
+}
+function vapid() {
+  const pub = Deno.env.get('VAPID_PUBLIC'), priv = Deno.env.get('VAPID_PRIVATE');
+  if (!pub || !priv) throw new Error('push_not_set_up');
+  webpush.setVapidDetails(Deno.env.get('VAPID_SUBJECT') || 'https://khamaysi15.github.io/tarek-garage/', pub, priv);
+}
+async function pushTo(db: any, subs: any[], payload: string) {
+  vapid();
   let sent = 0; const errors: string[] = [];
-  for (const s of subs || []) {
+  for (const s of subs) {
     const t0 = Date.now();
     try {
-      const r: any = await webpush.sendNotification(s.sub, payload, { TTL: 3600, urgency: 'high' });
+      const r: any = await webpush.sendNotification(s.sub, payload, { TTL: 6 * 3600, urgency: 'high' });
       sent++;
       await db.from('ai_log').insert({ action: 'push', ok: true, model: new URL(s.endpoint).host, ms: Date.now() - t0, error: 'status ' + (r && r.statusCode) });
     } catch (e: any) {
@@ -115,7 +122,37 @@ async function sendFoodReminders(db: any, onlyMissing = true) {
       if (e && (e.statusCode === 404 || e.statusCode === 410)) await db.from('push_subs').delete().eq('endpoint', s.endpoint);
     }
   }
-  return { sent, failed: errors.length, people: new Set((subs || []).map((s: any) => s.user_id)).size, error: errors[0] || null };
+  return { sent, failed: errors.length, people: new Set(subs.map((s: any) => s.user_id)).size, error: errors[0] || null };
+}
+
+/* ---------- "something new was opened" → every admin's phone ---------- */
+const fmtPlate = (p: string) => !p ? '' : p.length === 7 ? p.slice(0, 2) + '-' + p.slice(2, 5) + '-' + p.slice(5) : p.length === 8 ? p.slice(0, 3) + '-' + p.slice(3, 5) + '-' + p.slice(5) : p;
+const cut = (t: string, n = 120) => { t = (t || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+async function notifyNew(db: any, kind: string, id: string, senderId: string) {
+  const table = kind === 'order' ? 'orders' : 'reports';
+  const { data: row } = await db.from(table).select('data').eq('k', id).maybeSingle();
+  const d = row?.data;
+  if (!d) return { error: 'not_found' };
+  if (Date.now() - (d.createdAt || 0) > 30 * 60 * 1000) return { skipped: 'old' };   // only brand-new items
+  const { error: dup } = await db.from('notify_sent').insert({ k: table + ':' + id });
+  if (dup) return { already: true };                                                    // each item notifies once
+  let title: string, body: string, url: string;
+  if (kind === 'order') {
+    title = (d.urgent ? '❗ דחוף – ' : '') + '📦 הזמנת חלק חדשה';
+    body = [d.partName, d.sku && 'מק״ט ' + d.sku, '×' + (d.qty || 1), d.workerName && '· ' + d.workerName, d.note && '· ' + cut(d.note, 60)].filter(Boolean).join(' ');
+    url = './#/orders/' + id;
+  } else {
+    const e = (d.entries || [])[0] || {};
+    const what = cut(e.text || (e.recordings || []).map((r: any) => r.transcript).filter(Boolean).join(' ') || ((e.recordings || []).length ? '🎤 הקלטה קולית' : (e.photos || []).length ? '📷 תמונות' : ''), 90);
+    title = (d.service === 'rescue' ? '🛟 חילוץ דרך חדש' : '🔧 עבודה חדשה') + ' – ' + (d.type === 'trailer' ? 'נגרר' : 'משאית') + ' ' + fmtPlate(d.plate);
+    body = [d.createdByName, d.customer && '· ' + d.customer, d.service === 'rescue' && d.location?.text && '· 📍 ' + d.location.text, what && '· ' + what].filter(Boolean).join(' ');
+    url = './#/report/' + id;
+  }
+  const { data: admins } = await db.from('profiles').select('user_id').eq('role', 'admin').eq('active', true);
+  const targets = (admins || []).map((a: any) => a.user_id).filter((u: string) => u !== senderId);
+  if (!targets.length) return { sent: 0, people: 0 };
+  const { data: subs } = await db.from('push_subs').select('*').in('user_id', targets);
+  return await pushTo(db, subs || [], JSON.stringify({ title, body, url, tag: table + '-' + id }));
 }
 
 /* ---------- request handling ---------- */
@@ -246,6 +283,10 @@ Deno.serve(async (req) => {
         const ed = { ...(emp?.data || { id: eid, userId: uid }), name: patch.name ?? target.name, active: patch.active ?? target.active };
         await db.from('employees').upsert({ k: eid, data: ed });
         return json({ ok: true });
+      }
+      case 'notifyNew': {
+        if (!['report', 'order'].includes(body.kind) || !body.id) return json({ error: 'bad_request' }, 400);
+        return json(await notifyNew(db, body.kind, String(body.id), user.id));
       }
       case 'remindNow': {
         return json(await sendFoodReminders(db, body.all !== true));

@@ -1117,6 +1117,7 @@ async function viewNew(type, prePlate, rescue) {
       };
       await DB.put('reports', r); await upsertVehicle(r);
       patchTranscriptsLater(r.id, r.entries[0], comp);
+      notifyAdmins('report', r.id);
       dirtyCheck = null; toast(rescue ? 'החילוץ נשמר ✓' : 'העבודה נשמרה ✓', 'ok'); go('#/report/' + r.id);
     } catch (e) {
       console.error(e); alert('השמירה נכשלה: ' + niceErr(e));
@@ -1165,7 +1166,7 @@ async function enablePush() {
     const sub = (await reg.pushManager.getSubscription()) || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(VAPID_PUBLIC) });
     const { error } = await sb.from('push_subs').upsert({ endpoint: sub.endpoint, user_id: me.user_id, sub: sub.toJSON() });
     if (error) throw error;
-    local.set('pushOn', '1'); toast('🔔 תקבל תזכורת לבחור אוכל', 'ok'); route();
+    local.set('pushOn', '1'); toast(isAdmin() ? '🔔 תקבל התראות: אוכל, עבודות, חילוצים והזמנות' : '🔔 תקבל תזכורת לבחור אוכל', 'ok'); route();
   } catch (e) { console.error(e); alert('לא הצלחתי להפעיל התראות: ' + niceErr(e)); }
 }
 async function foodCard() {
@@ -1357,6 +1358,7 @@ async function viewOrderForm(id, prePlate) {
       Object.assign(o, { sku: sku.value.trim(), partName: partName.value.trim(), qty: n, note: note.value.trim(), urgent: urgent.checked, updatedAt: now });
       o.photos = [...(o.photos || []), ...photos];
       await DB.put('orders', o);
+      if (!old) notifyAdmins('order', o.id);
       dirtyCheck = null; toast(old ? 'ההזמנה עודכנה ✓' : 'ההזמנה נשלחה ✓', 'ok'); go('#/orders/' + o.id);
     } catch (e) { alert('השמירה נכשלה: ' + niceErr(e)); saveBtn.disabled = false; fill(saveBtn, ic('check'), old ? 'שמור שינויים' : 'שלח הזמנה'); }
   };
@@ -1394,12 +1396,72 @@ async function viewOrder(id) {
     canEditOrder(o) && h('div', { class: 'row', style: 'margin-bottom:14px' },
       h('a', { class: 'btn', href: '#/orders/' + id + '/edit' }, ic('edit'), 'ערוך הזמנה'),
       !isAdmin() && h('button', { type: 'button', class: 'btn danger', onclick: () => { if (confirm('לבטל את ההזמנה?')) setStatus('cancelled'); } }, 'בטל הזמנה')),
+    ShareCard(orderShareText(o), o.photos || []),
     h('div', { class: 'card' }, h('h3', {}, 'היסטוריה'), h('ul', { class: 'log' }, (o.statusLog || []).slice().reverse().map(l => h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', ORDER_STATUS[l.status] || l.status, l.byName ? ' · ' + l.byName : '')))),
     isAdmin() && sb && h('button', { type: 'button', class: 'btn wide danger', onclick: async () => {
       if (!confirm('למחוק את ההזמנה לגמרי?')) return;
       try { await DB.del('orders', id); for (const b of o.photos || []) { try { await Blobs.del(b); } catch { } } toast('נמחקה', 'ok'); go('#/orders'); } catch (e) { alert(niceErr(e)); }
     } }, ic('trash'), 'מחק הזמנה (מנהל)'));
 }
+/* ---------- tell every admin about something new + share to WhatsApp ---------- */
+function notifyAdmins(kind, id) {
+  if (!sb || !me) return;
+  garageCall({ action: 'notifyNew', kind, id }, 30000).catch(e => console.warn('admin notify failed', e));
+}
+const appLink = hash => location.origin + location.pathname + hash;
+function reportShareText(r) {
+  const L = [];
+  L.push((r.service === 'rescue' ? '🛟 חילוץ דרך' : '🔧 עבודה') + ' – ' + typeName(r.type) + ' ' + fmtPlate(r.plate));
+  if (r.customer) L.push('לקוח: ' + r.customer);
+  if (r.model) L.push('דגם: ' + r.model);
+  if (r.km) L.push('ק״מ: ' + fmtNum(r.km));
+  if (r.location && (r.location.text || r.location.lat)) L.push('📍 ' + (r.location.text || '') + (r.location.lat ? ' https://maps.google.com/?q=' + r.location.lat + ',' + r.location.lng : ''));
+  for (const e of r.entries || []) {
+    L.push('');
+    L.push('📅 ' + fmtDT(e.workAt || e.at) + ' · 👷 ' + (e.workerName || ''));
+    if (e.text) L.push(e.text);
+    for (const rc of e.recordings || []) if (rc.transcript) L.push('🎤 ' + rc.transcript);
+    if ((e.photos || []).length) L.push('📷 ' + e.photos.length + ' תמונות');
+  }
+  L.push('', '🔗 ' + appLink('#/report/' + r.id));
+  return L.join('\n');
+}
+function orderShareText(o) {
+  return [(o.urgent ? '❗ דחוף – ' : '') + '📦 הזמנת חלק',
+    o.partName && 'חלק: ' + o.partName, o.sku && 'מק״ט: ' + o.sku, 'כמות: ' + o.qty,
+    o.note && 'הערות: ' + o.note, 'מזמין: ' + (o.workerName || '') + ' · ' + fmtDT(o.createdAt),
+    'סטטוס: ' + (ORDER_STATUS[o.status] || o.status), (o.photos || []).length && '📷 ' + o.photos.length + ' תמונות',
+    '', '🔗 ' + appLink('#/orders/' + o.id)].filter(x => x || x === '').join('\n');
+}
+// admins only: a green WhatsApp button (text) + "with photos" through the phone's share sheet
+function ShareCard(text, blobIds) {
+  if (!isAdmin()) return null;
+  let files = null;
+  const canFiles = !!(navigator.canShare && navigator.share);
+  const photoBtn = canFiles && blobIds.length ? h('button', { type: 'button', class: 'btn', disabled: true }, h('span', { class: 'spin' }), ' מכין תמונות…') : null;
+  if (photoBtn) (async () => {
+    try {
+      const out = [];
+      for (const [i, id] of blobIds.slice(0, 8).entries()) {
+        const u = await blobURL(id); if (!u) continue;
+        const b = await (await fetch(u)).blob();
+        out.push(new File([b], 'photo-' + (i + 1) + '.jpg', { type: b.type || 'image/jpeg' }));
+      }
+      if (out.length && navigator.canShare({ files: out })) { files = out; photoBtn.disabled = false; fill(photoBtn, '📷 שתף עם תמונות'); }
+      else photoBtn.remove();
+    } catch (e) { console.warn(e); photoBtn.remove(); }
+  })();
+  if (photoBtn) photoBtn.onclick = async () => {
+    try { await navigator.share({ text, files }); }
+    catch (e) { if (e.name !== 'AbortError') { try { await navigator.share({ text }); } catch { } } }
+  };
+  return h('div', { class: 'card' }, h('h3', {}, 'שיתוף'),
+    h('div', { class: 'row' },
+      h('a', { class: 'btn', style: 'background:#25d366;color:#fff;border-color:#25d366', href: 'https://wa.me/?text=' + encodeURIComponent(text), target: '_blank', rel: 'noopener' }, '🟢 שתף בוואטסאפ'),
+      photoBtn),
+    photoBtn && h('p', { class: 'hint' }, '"שתף עם תמונות" פותח את תפריט השיתוף של הטלפון – בחר שם וואטסאפ.'));
+}
+const reportPhotoIds = r => [r.plateImage, ...(r.entries || []).flatMap(e => e.photos || [])].filter(Boolean);
 async function showVehicleSheet(plate) {
   const reps = (await DB.byPlate(plate)).sort((a, b) => workTime(b) - workTime(a));
   const s = openSheet('טיפולים קודמים – ' + fmtPlate(plate), h('div'));
@@ -1466,6 +1528,7 @@ async function viewReport(id) {
       ? h('a', { class: 'btn wide', href: '#/report/' + id + '/edit', style: 'margin-bottom:14px' }, ic('edit'), isAdmin() ? 'תקן או מחק בדיווח' : 'תקן טעות בעבודה שלי')
       : h('p', { class: 'hint', style: 'margin:0 0 14px' }, 'אפשר להוסיף עבודה לדיווח הזה. תיקון של עבודה שרשם עובד אחר – רק מנהל.'),
     await reportBody(r),
+    ShareCard(reportShareText(r), reportPhotoIds(r)),
     h('a', { class: 'btn wide', href: '#/vehicle/' + r.plate }, ic('clock'), 'כל הטיפולים של הרכב הזה'),
     isAdmin() && sb && h('button', { type: 'button', class: 'btn wide danger', style: 'margin-top:10px', onclick: async () => {
       if (!confirm('למחוק את כל הדיווח של ' + fmtPlate(r.plate) + ' מ-' + fmtDate(r.createdAt) + '?\nכולל ההקלטות והתמונות. אי אפשר לבטל.')) return;
