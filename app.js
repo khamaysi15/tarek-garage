@@ -1408,58 +1408,57 @@ function notifyAdmins(kind, id) {
   if (!sb || !me) return;
   garageCall({ action: 'notifyNew', kind, id }, 30000).catch(e => console.warn('admin notify failed', e));
 }
-const appLink = hash => location.origin + location.pathname + hash;
+// the shared message goes to an outside supplier: only what he needs to quote / order parts –
+// no customer, no worker names, no internal app link
 function reportShareText(r) {
-  const L = [];
-  L.push((r.service === 'rescue' ? '🛟 חילוץ דרך' : '🔧 עבודה') + ' – ' + typeName(r.type) + ' ' + fmtPlate(r.plate));
-  if (r.customer) L.push('לקוח: ' + r.customer);
+  const L = ['מוסך טארק – בקשה לחלקים', ''];
+  L.push(typeName(r.type) + ' ' + fmtPlate(r.plate));
   if (r.model) L.push('דגם: ' + r.model);
   if (r.km) L.push('ק״מ: ' + fmtNum(r.km));
-  if (r.location && (r.location.text || r.location.lat)) L.push('📍 ' + (r.location.text || '') + (r.location.lat ? ' https://maps.google.com/?q=' + r.location.lat + ',' + r.location.lng : ''));
   for (const e of r.entries || []) {
-    L.push('');
-    L.push('📅 ' + fmtDT(e.workAt || e.at) + ' · 👷 ' + (e.workerName || ''));
-    if (e.text) L.push(e.text);
-    for (const rc of e.recordings || []) if (rc.transcript) L.push('🎤 ' + rc.transcript);
-    if ((e.photos || []).length) L.push('📷 ' + e.photos.length + ' תמונות');
+    const t = [e.text, ...(e.recordings || []).map(rc => rc.transcript)].filter(Boolean).join('\n');
+    if (t) L.push('', t);
   }
-  L.push('', '🔗 ' + appLink('#/report/' + r.id));
   return L.join('\n');
 }
 function orderShareText(o) {
-  return [(o.urgent ? '❗ דחוף – ' : '') + '📦 הזמנת חלק',
+  return ['מוסך טארק – הזמנת חלק' + (o.urgent ? ' (דחוף)' : ''), '',
     o.partName && 'חלק: ' + o.partName, o.sku && 'מק״ט: ' + o.sku, 'כמות: ' + o.qty,
-    o.note && 'הערות: ' + o.note, 'מזמין: ' + (o.workerName || '') + ' · ' + fmtDT(o.createdAt),
-    'סטטוס: ' + (ORDER_STATUS[o.status] || o.status), (o.photos || []).length && '📷 ' + o.photos.length + ' תמונות',
-    '', '🔗 ' + appLink('#/orders/' + o.id)].filter(x => x || x === '').join('\n');
+    o.note && 'הערות: ' + o.note].filter(x => x || x === '').join('\n');
 }
-// admins only: a green WhatsApp button (text) + "with photos" through the phone's share sheet
+// admins only: one button – with photos through the phone's share sheet (pick WhatsApp), or plain WhatsApp text
 function ShareCard(text, blobIds) {
   if (!isAdmin()) return null;
   let files = null;
-  const canFiles = !!(navigator.canShare && navigator.share);
-  const photoBtn = canFiles && blobIds.length ? h('button', { type: 'button', class: 'btn', disabled: true }, h('span', { class: 'spin' }), ' מכין תמונות…') : null;
-  if (photoBtn) (async () => {
-    try {
-      const out = [];
-      for (const [i, id] of blobIds.slice(0, 8).entries()) {
-        const u = await blobURL(id); if (!u) continue;
-        const b = await (await fetch(u)).blob();
-        out.push(new File([b], 'photo-' + (i + 1) + '.jpg', { type: b.type || 'image/jpeg' }));
-      }
-      if (out.length && navigator.canShare({ files: out })) { files = out; photoBtn.disabled = false; fill(photoBtn, '📷 שתף עם תמונות'); }
-      else photoBtn.remove();
-    } catch (e) { console.warn(e); photoBtn.remove(); }
-  })();
-  if (photoBtn) photoBtn.onclick = async () => {
+  const wa = () => window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');
+  const green = 'background:#25d366;color:#fff;border-color:#25d366';
+  const withPhotos = !!(navigator.canShare && navigator.share) && blobIds.length > 0;
+  const main = h('button', { type: 'button', class: 'btn big', style: green }, '🟢 שתף לספק בוואטסאפ');
+  const textOnly = h('button', { type: 'button', class: 'btn sm', onclick: wa }, 'שלח טקסט בלבד');
+  const status = h('p', { class: 'hint' });
+  if (withPhotos) {
+    main.disabled = true; fill(status, h('span', { class: 'spin' }), ' מכין תמונות…');
+    (async () => {
+      try {
+        const out = [];
+        for (const [i, id] of blobIds.slice(0, 8).entries()) {
+          const u = await blobURL(id); if (!u) continue;
+          const b = await (await fetch(u)).blob();
+          out.push(new File([b], 'photo-' + (i + 1) + '.jpg', { type: b.type || 'image/jpeg' }));
+        }
+        if (out.length && navigator.canShare({ files: out })) files = out;
+      } catch (e) { console.warn(e); }
+      main.disabled = false;
+      fill(status, files ? 'נפתח תפריט השיתוף עם ' + files.length + ' תמונות – בחר וואטסאפ ואת הספק.' : '');
+    })();
+  }
+  main.onclick = async () => {
+    if (!files) { wa(); return; }
     try { await navigator.share({ text, files }); }
-    catch (e) { if (e.name !== 'AbortError') { try { await navigator.share({ text }); } catch { } } }
+    catch (e) { if (e.name !== 'AbortError') wa(); }
   };
-  return h('div', { class: 'card' }, h('h3', {}, 'שיתוף'),
-    h('div', { class: 'row' },
-      h('a', { class: 'btn', style: 'background:#25d366;color:#fff;border-color:#25d366', href: 'https://wa.me/?text=' + encodeURIComponent(text), target: '_blank', rel: 'noopener' }, '🟢 שתף בוואטסאפ'),
-      photoBtn),
-    photoBtn && h('p', { class: 'hint' }, '"שתף עם תמונות" פותח את תפריט השיתוף של הטלפון – בחר שם וואטסאפ.'));
+  return h('div', { class: 'card' }, h('h3', {}, 'שיתוף לספק'), main, status,
+    h('div', { class: 'row', style: 'margin-top:8px' }, textOnly));
 }
 const reportPhotoIds = r => [r.plateImage, ...(r.entries || []).flatMap(e => e.photos || [])].filter(Boolean);
 async function showVehicleSheet(plate) {
