@@ -226,6 +226,11 @@ Deno.serve(async (req) => {
       }
       case 'whoami':
         return json({ profile: me });
+      // any active worker: a new job / rescue / parts order → every admin's phone
+      case 'notifyNew': {
+        if (!['report', 'order'].includes(body.kind) || !body.id) return json({ error: 'bad_request' }, 400);
+        return json(await notifyNew(db, body.kind, String(body.id), user.id));
+      }
     }
 
     // ---- everything below is for admins only ----
@@ -283,10 +288,6 @@ Deno.serve(async (req) => {
         const ed = { ...(emp?.data || { id: eid, userId: uid }), name: patch.name ?? target.name, active: patch.active ?? target.active };
         await db.from('employees').upsert({ k: eid, data: ed });
         return json({ ok: true });
-      }
-      case 'notifyNew': {
-        if (!['report', 'order'].includes(body.kind) || !body.id) return json({ error: 'bad_request' }, 400);
-        return json(await notifyNew(db, body.kind, String(body.id), user.id));
       }
       case 'remindNow': {
         return json(await sendFoodReminders(db, body.all !== true));
