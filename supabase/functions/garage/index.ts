@@ -1,5 +1,5 @@
 // מוסך טארק – server function: Hebrew transcription, plate reading, user management.
-// Secrets (set with `supabase secrets set`): GEMINI_API_KEY, optional GEMINI_MODEL.
+// Secrets (set with `supabase secrets set`): GROQ_API_KEY (fast, tried first), GEMINI_API_KEY (backup), optional GEMINI_MODEL / GROQ_VISION_MODEL / GROQ_STT_MODEL.
 import { createClient } from 'npm:@supabase/supabase-js@2.118.0';
 import webpush from 'npm:web-push@3.6.7';
 
@@ -62,6 +62,55 @@ async function gemini(parts: unknown[], wantJson = false): Promise<{ text: strin
     busyUntil.clear();
   }
   throw new Error(last || 'gemini unavailable');
+}
+
+/* ---------- Groq (fast; tried first when GROQ_API_KEY is set, Gemini is the backup) ---------- */
+const groqKey = () => Deno.env.get('GROQ_API_KEY') || '';
+let groqBusyUntil = 0;
+async function groqVision(prompt: string, b64: string, mime: string): Promise<{ text: string; model: string }> {
+  const model = Deno.env.get('GROQ_VISION_MODEL') || 'qwen/qwen3.8-27b';
+  const req = (extra: Record<string, unknown>) => fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + groqKey() },
+    signal: AbortSignal.timeout(12000),
+    body: JSON.stringify({
+      model, temperature: 0, max_completion_tokens: 300, response_format: { type: 'json_object' }, ...extra,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } }] }],
+    }),
+  });
+  let r = await req({ reasoning_effort: 'none' });
+  if (r.status === 400) r = await req({});          // model without a reasoning switch
+  if (!r.ok) throw new Error('groq ' + model + ' ' + r.status + ' ' + (await r.text()).slice(0, 160));
+  const d = await r.json();
+  const text = String(d.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  return { text, model: 'groq ' + model };
+}
+const STT_VOCAB = 'מוסך משאיות ונגררים. כרית אוויר, צינור אוויר, מדחס, רפידות בלם, דיסק, תוף בלם, מסנן שמן, מסנן סולר, גיר, דיפרנציאל, מצמד, מתנע, אלטרנטור, מצבר, צמיג, סרן, מסבים, קפיץ, בולם, טכוגרף, ברקס, DAF, Volvo, Scania, Mercedes, MAN, Renault, Iveco, Wabco, Knorr.';
+async function groqStt(b64: string, mime: string): Promise<{ text: string; model: string }> {
+  const model = Deno.env.get('GROQ_STT_MODEL') || 'whisper-large-v3';
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const ext = /wav/.test(mime) ? 'wav' : /webm/.test(mime) ? 'webm' : /ogg/.test(mime) ? 'ogg' : /mpeg|mp3/.test(mime) ? 'mp3' : 'm4a';
+  const fd = new FormData();
+  fd.append('file', new Blob([bytes], { type: mime }), 'audio.' + ext);
+  fd.append('model', model); fd.append('language', 'he'); fd.append('temperature', '0');
+  fd.append('response_format', 'json'); fd.append('prompt', STT_VOCAB);
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + groqKey() }, body: fd, signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error('groq ' + model + ' ' + r.status + ' ' + (await r.text()).slice(0, 160));
+  let text = String((await r.json()).text || '').trim();
+  if (/^(תודה( רבה)?|תודה שצפיתם|כתוביות.*)[.!]?$/.test(text)) text = '';   // Whisper's typical "silence" hallucinations
+  return { text, model: 'groq ' + model };
+}
+// try Groq first (seconds), fall back to Gemini (slow free tier) if Groq is missing, busy or fails
+async function fast<T>(viaGroq: () => Promise<T>, viaGemini: () => Promise<T>, note: (e: string) => void): Promise<T> {
+  if (groqKey() && Date.now() > groqBusyUntil) {
+    try { return await viaGroq(); }
+    catch (e) {
+      const m = String((e as Error).message || e); note(m);
+      if (/ 429 | 5\d\d |Timeout/.test(m)) groqBusyUntil = Date.now() + 60e3;
+    }
+  }
+  return viaGemini();
 }
 
 const TRANSCRIBE_PROMPT = `תמלל את ההקלטה המצורפת לעברית, מילה במילה.
@@ -196,7 +245,9 @@ Deno.serve(async (req) => {
         if (!body.audio) return json({ error: 'no_audio' }, 400);
         const t0 = Date.now();
         try {
-          const { text, model } = await gemini([{ text: body.short ? SHORT_PROMPT : TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]);
+          const { text, model } = await fast(() => groqStt(body.audio, body.mime || 'audio/mp4'),
+            () => gemini([{ text: body.short ? SHORT_PROMPT : TRANSCRIBE_PROMPT }, { inline_data: { mime_type: body.mime || 'audio/mp4', data: body.audio } }]),
+            e => log('transcribe', false, 'groq', t0, e));
           await log('transcribe', true, model, t0, null);
           return json({ text, model });
         } catch (e) { await log('transcribe', false, null, t0, String((e as Error).message || e)); throw e; }
@@ -206,7 +257,9 @@ Deno.serve(async (req) => {
         const t0 = Date.now();
         let out = '', model = '';
         try {
-          ({ text: out, model } = await gemini([{ text: PLATE_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true));
+          ({ text: out, model } = await fast(() => groqVision(PLATE_PROMPT, body.image, body.mime || 'image/jpeg'),
+            () => gemini([{ text: PLATE_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true),
+            e => log('plate', false, 'groq', t0, e)));
           await log('plate', true, model, t0, 'answer: ' + out.slice(0, 120));
         } catch (e) { await log('plate', false, null, t0, String((e as Error).message || e)); throw e; }
         let p: any = {};
@@ -218,7 +271,9 @@ Deno.serve(async (req) => {
         if (!body.image) return json({ error: 'no_image' }, 400);
         const t0 = Date.now();
         try {
-          const { text: out, model } = await gemini([{ text: SKU_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true);
+          const { text: out, model } = await fast(() => groqVision(SKU_PROMPT, body.image, body.mime || 'image/jpeg'),
+            () => gemini([{ text: SKU_PROMPT }, { inline_data: { mime_type: body.mime || 'image/jpeg', data: body.image } }], true),
+            e => log('sku', false, 'groq', t0, e));
           await log('sku', true, model, t0, 'answer: ' + out.slice(0, 120));
           let p: any = {}; try { p = JSON.parse(out); } catch { }
           return json({ sku: String(p.sku || '').trim(), name: String(p.name || '').trim(), brand: String(p.brand || '').trim(), model });
