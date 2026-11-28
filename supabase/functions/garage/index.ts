@@ -195,6 +195,10 @@ async function notifyNew(db: any, kind: string, id: string, senderId: string) {
     const what = cut(e.text || (e.recordings || []).map((r: any) => r.transcript).filter(Boolean).join(' ') || ((e.recordings || []).length ? '🎤 הקלטה קולית' : (e.photos || []).length ? '📷 תמונות' : ''), 90);
     title = (d.service === 'rescue' ? '🛟 חילוץ דרך חדש' : '🔧 עבודה חדשה') + ' – ' + (d.type === 'trailer' ? 'נגרר' : 'משאית') + ' ' + fmtPlate(d.plate);
     body = [d.createdByName, d.customer && '· ' + d.customer, d.service === 'rescue' && d.location?.text && '· 📍 ' + d.location.text, what && '· ' + what].filter(Boolean).join(' ');
+    if (d.card) {
+      title = '🗂️ כרטיס חדש – ' + (d.type === 'trailer' ? 'נגרר' : 'משאית') + ' ' + fmtPlate(d.plate);
+      body = [d.customer, d.card.driver && '· נהג: ' + d.card.driver, (d.card.complaints || []).length && '· ' + cut(d.card.complaints.join(', '), 90)].filter(Boolean).join(' ') || (d.createdByName || '');
+    }
     url = './#/report/' + id;
   }
   const { data: admins } = await db.from('profiles').select('user_id').eq('role', 'admin').eq('active', true);

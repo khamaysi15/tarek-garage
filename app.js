@@ -730,7 +730,7 @@ function reportItem(r, onClick) {
   const allPh = r.entries.reduce((n, e) => n + e.photos.length, 0);
   const text = r.entries.map(e => e.text || e.recordings.map(x => x.transcript).join(' ')).filter(Boolean).join(' · ');
   return h('button', { class: 'item', type: 'button', onclick: onClick || (() => go('#/report/' + r.id)) },
-    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך'), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(workTime(r)))),
+    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך'), r.card && cardTag(r.card.status), h('span', { class: 'grow' }), h('b', { style: 'font-size:15px' }, fmtDate(workTime(r)))),
     h('div', { class: 'meta' }, h('span', {}, r.customer || 'ללא שם לקוח'), h('span', {}, fmtTime(workTime(r))), h('span', {}, first.workerName || '')),
     text && h('div', { class: 'snip' }, text),
     h('div', { class: 'counts' },
@@ -744,16 +744,17 @@ async function reportBody(r) {
   const el = h('div');
   const plateImg = await blobURL(r.plateImage);
   el.append(h('div', { class: 'card' },
-    h('div', { class: 'item-top' }, plateBadge(r.plate, true), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך')),
+    h('div', { class: 'item-top' }, plateBadge(r.plate, true), typeTag(r.type), r.service === 'rescue' && h('span', { class: 'tag rescue' }, 'חילוץ דרך'), r.card && h('span', { class: 'tag' }, '🗂️ כרטיס')),
     h('dl', { class: 'kv' },
       r.service === 'rescue' && [h('dt', {}, 'מיקום החילוץ'), h('dd', {}, locLink(r.location) || '—')],
       h('dt', {}, 'לקוח'), h('dd', {}, r.customer || '—'),
-      r.type === 'truck' && [h('dt', {}, 'דגם'), h('dd', {}, r.model || '—'), h('dt', {}, 'קילומטרים'), h('dd', {}, r.km ? fmtNum(r.km) : '—')],
+      r.type === 'truck' && [!r.card && [h('dt', {}, 'דגם'), h('dd', {}, r.model || '—')], h('dt', {}, 'קילומטרים'), h('dd', {}, r.km ? fmtNum(r.km) : '—')],
       h('dt', {}, 'תאריך העבודה'), h('dd', {}, fmtDT(workTime(r))),
       Math.abs(workTime(r) - r.createdAt) > 30 * 60e3 && [h('dt', {}, 'נרשם במערכת'), h('dd', {}, fmtDT(r.createdAt))],
       r.updatedAt && r.updatedAt - r.createdAt > 60e3 && [h('dt', {}, 'עדכון אחרון'), h('dd', {}, fmtDT(r.updatedAt))],
       h('dt', {}, 'נפתח ע״י'), h('dd', {}, r.createdByName || '—')),
     plateImg && h('div', { style: 'margin-top:12px' }, h('div', { class: 'sec-title', style: 'margin-top:0' }, 'צילום לוחית הרישוי'), photoGrid([plateImg]))));
+  if (r.card && !r.entries.length) el.append(h('div', { class: 'empty', style: 'padding:18px' }, 'עוד לא נרשמה עבודה על הכרטיס הזה.'));
   for (let i = 0; i < r.entries.length; i++) {
     const e = r.entries[i];
     const label = e.kind === 'note' ? 'הערה' : i === 0 ? 'העבודה שבוצעה' : 'עבודה נוספת';
@@ -788,7 +789,7 @@ function versionsEl(vs) {
 }
 const byNote = x => (x.byName && x.byName !== x.workerName ? ' (הוזן ע״י ' + x.byName + ')' : '');
 function logLine(l) {
-  const what = l.action === 'create' ? 'יצר/ה את הדיווח' : l.action === 'add' ? (l.kind === 'note' ? 'הוסיף/ה הערה' : 'הוסיף/ה עבודה') : 'תיקן/ה את הדיווח';
+  const what = l.action === 'card' ? 'עדכן/ה את הכרטיס' : l.action === 'create' ? 'יצר/ה את הדיווח' : l.action === 'add' ? (l.kind === 'note' ? 'הוסיף/ה הערה' : 'הוסיף/ה עבודה') : 'תיקן/ה את הדיווח';
   return h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', l.workerName, byNote(l), ' · ', what,
     l.changes && l.changes.length ? h('div', { class: 'chg' }, l.changes.map(c => h('div', {}, c.field + ': "' + (c.from || '—') + '" ← "' + (c.to || '—') + '"'))) : null);
 }
@@ -831,6 +832,9 @@ async function route() {
     else if (p[0] === 'orders' && p[1] && p[2] === 'edit') await viewOrderForm(p[1]);
     else if (p[0] === 'orders' && p[1]) await viewOrder(p[1]);
     else if (p[0] === 'orders') await viewOrders(q.get('s') || 'open');
+    else if (p[0] === 'cards' && p[1] === 'new') await viewCardForm(null);
+    else if (p[0] === 'cards' && p[1] && p[2] === 'edit') await viewCardForm(p[1]);
+    else if (p[0] === 'cards') await viewCards(q.get('s') || 'open');
     else if (p[0] === 'history') await viewHistory(q.get('q') || '');
     else if (p[0] === 'vehicle') await viewVehicle(decodeURIComponent(p[1] || ''));
     else if (p[0] === 'report' && p[2] === 'add') await viewAdd(p[1]);
@@ -849,7 +853,7 @@ async function route() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !sb || (dirtyCheck && dirtyCheck())) return;
   const p = (location.hash.slice(1) || '/').split('?')[0];
-  if (p === '/' || p === '' || p.startsWith('/history') || p.startsWith('/vehicle') || p === '/admin' || p.startsWith('/admin/works')) route();
+  if (p === '/' || p === '' || p.startsWith('/history') || p.startsWith('/cards') || p.startsWith('/vehicle') || p === '/admin' || p.startsWith('/admin/works')) route();
 });
 
 /* ---------- login (one garage account per phone, stays signed in) ---------- */
@@ -982,6 +986,7 @@ async function viewHome() {
   const nLocal = await localJobsCount();
   fill(view,
     nLocal > 0 && moveLocalCard(nLocal),
+    await cardsTile(),
     h('div', { class: 'card' }, h('h2', { class: 'pick-title' }, 'בחר סוג רכב'), await vehicleButtons()),
     await homeExtras(),
     h('a', { class: 'btn big dark', href: '#/history', style: 'margin-bottom:14px' }, ic('search'), 'חיפוש היסטוריית טיפולים'),
@@ -1415,6 +1420,7 @@ function reportShareText(r) {
   L.push(typeName(r.type) + ' ' + fmtPlate(r.plate));
   if (r.model) L.push('דגם: ' + r.model);
   if (r.km) L.push('ק״מ: ' + fmtNum(r.km));
+  if (r.card && (r.card.inspection || []).length) L.push('', 'לטיפול:', ...r.card.inspection.map((x, i) => (i + 1) + '. ' + x));
   for (const e of r.entries || []) {
     const t = [e.text, ...(e.recordings || []).map(rc => rc.transcript)].filter(Boolean).join('\n');
     if (t) L.push('', t);
@@ -1461,6 +1467,187 @@ function ShareCard(text, blobIds) {
     h('div', { class: 'row', style: 'margin-top:8px' }, textOnly));
 }
 const reportPhotoIds = r => [r.plateImage, ...(r.entries || []).flatMap(e => e.photos || [])].filter(Boolean);
+/* ---------- job cards (כרטיסי עבודה): a second way of working, next to the regular reports ----------
+   An admin opens a card (vehicle photo, plate, driver, customer, code, km, driver's complaints),
+   writes the inspection (what has to be replaced / done), the customer approves → the card is "in work".
+   Workers open "כרטיסים פתוחים", tap the vehicle and only record/write their work.
+   A card is a normal report with service:'card' and a `card` object, so history, exports and
+   permissions keep working; old reports are untouched. */
+const CARD_STATUS = { inspect: 'בבדיקה – ממתין לאישור לקוח', approved: 'מאושר – בעבודה', closed: 'סגור – הרכב יצא' };
+const CARD_SHORT = { inspect: 'בבדיקה', approved: 'בעבודה', closed: 'סגור' };
+const cardTag = st => h('span', { class: 'tag ' + ({ inspect: 'st-open', approved: 'st-ordered', closed: 'st-received' }[st] || '') }, CARD_SHORT[st] || st);
+const CARDS_SVG = `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+<rect x="22" y="16" width="76" height="96" rx="10" fill="#fff" stroke="#0b2f5e" stroke-width="4"/>
+<rect x="42" y="8" width="36" height="18" rx="6" fill="#f5b400" stroke="#0b2f5e" stroke-width="4"/>
+<g stroke="#0b2f5e" stroke-width="5" stroke-linecap="round"><line x1="50" y1="46" x2="84" y2="46"/><line x1="50" y1="66" x2="84" y2="66"/><line x1="50" y1="86" x2="74" y2="86"/></g>
+<g fill="none" stroke="#0f7a55" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M33 46l4 4 7-8"/><path d="M33 66l4 4 7-8"/></g>
+<circle cx="38" cy="86" r="4" fill="#c62f22"/></svg>`;
+const isOpenCard = r => r.card && r.card.status !== 'closed';
+async function cardsTile() {
+  let n = 0; try { n = (await DB.all('reports')).filter(isOpenCard).length; } catch { }
+  return h('button', { class: 'cards-tile', type: 'button', onclick: () => go('#/cards') },
+    h('div', { class: 'pic', html: CARDS_SVG }),
+    h('div', { class: 'grow' }, h('b', {}, 'כרטיסים פתוחים'), h('span', {}, n === 1 ? 'רכב אחד בשטח העבודה' : n ? n + ' רכבים בשטח העבודה' : 'אין כרטיסים פתוחים כרגע')),
+    n > 0 && h('span', { class: 'badge' }, n));
+}
+function cardItem(r) {
+  const c = r.card, works = r.entries.filter(e => e.kind !== 'note').length;
+  return h('button', { class: 'item', type: 'button', onclick: () => go('#/report/' + r.id) },
+    h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', { class: 'grow' }), cardTag(c.status)),
+    h('div', { class: 'meta' }, h('span', {}, r.customer || 'ללא שם לקוח'), c.driver && h('span', {}, 'נהג: ' + c.driver), h('span', {}, 'נפתח ' + fmtDate(r.createdAt))),
+    (c.complaints || []).length ? h('div', { class: 'snip' }, c.complaints.join(' · ')) : null,
+    h('div', { class: 'counts' }, (c.inspection || []).length > 0 && h('span', {}, ic('doc'), c.inspection.length + ' לטיפול'),
+      h('span', {}, ic('check'), works ? works + ' עבודות נרשמו' : 'עוד לא נרשמה עבודה')));
+}
+async function viewCards(filter) {
+  setHeader('', 'כרטיסים פתוחים', '#/');
+  const all = (await DB.all('reports')).filter(r => r.card).sort((a, b) => b.createdAt - a.createdAt);
+  const tabs = [['open', 'פתוחים', r => r.card.status !== 'closed'], ['inspect', 'בבדיקה', r => r.card.status === 'inspect'],
+    ['approved', 'בעבודה', r => r.card.status === 'approved'], ['closed', 'סגורים', r => r.card.status === 'closed']];
+  const cur = tabs.find(t => t[0] === filter) || tabs[0];
+  let list = all.filter(cur[2]); if (cur[0] === 'closed') list = list.slice(0, 50);
+  fill(view,
+    isAdmin() && h('a', { class: 'btn big ok', href: '#/cards/new', style: 'margin-bottom:12px' }, ic('plus'), 'פתיחת כרטיס חדש'),
+    h('div', { class: 'chips', style: 'margin-bottom:12px' }, tabs.map(([k, l, f]) => h('button', { type: 'button', class: 'chip' + (k === cur[0] ? ' on' : ''), onclick: () => go('#/cards?s=' + k) }, l + ' (' + all.filter(f).length + ')'))),
+    !isAdmin() && cur[0] === 'open' && h('p', { class: 'hint', style: 'margin:0 2px 10px' }, 'לחץ על הרכב שאתה עובד עליו ורשום או הקלט את העבודה. פרטי הלקוח כבר רשומים בכרטיס.'),
+    list.length ? list.map(cardItem) : h('div', { class: 'empty' }, cur[0] === 'open' ? 'אין כרטיסים פתוחים.' : 'אין כרטיסים כאן.'));
+}
+function ListField(title, placeholder, init, hint) {
+  const box = h('div');
+  const renum = () => [...box.children].forEach((row, i) => { row.firstChild.textContent = (i + 1) + '.'; });
+  const add = (v = '') => {
+    const inp = h('input', { class: 'input', placeholder, value: v, autocomplete: 'off' });
+    const row = h('div', { class: 'list-row' }, h('b', { class: 'num' }), micFor(inp),
+      h('button', { type: 'button', class: 'btn sm', 'aria-label': 'מחק שורה', onclick: () => { row.remove(); if (!box.children.length) add(); renum(); } }, '✕'));
+    box.append(row); renum(); return inp;
+  };
+  (init && init.length ? init : ['']).forEach(v => add(v));
+  return {
+    el: h('div', { class: 'card' }, h('h3', {}, title), hint && h('p', { class: 'hint', style: 'margin-top:0' }, hint), box,
+      h('button', { type: 'button', class: 'btn sm', style: 'margin-top:10px', onclick: () => add().focus() }, ic('plus'), 'שורה נוספת')),
+    get: () => [...box.querySelectorAll('input')].map(x => x.value.trim()).filter(Boolean),
+  };
+}
+async function viewCardForm(id) {
+  if (!isAdmin()) { toast('פתיחת כרטיס – רק מנהל', 'bad'); go('#/cards'); return; }
+  const old = id ? await DB.get('reports', id) : null;
+  if (id && !(old && old.card)) { setHeader('', 'כרטיס', '#/cards'); fill(view, h('div', { class: 'empty' }, 'הכרטיס לא נמצא')); return; }
+  setHeader('', old ? 'עריכת כרטיס ' + fmtPlate(old.plate) : 'פתיחת כרטיס חדש', old ? '#/report/' + id : '#/cards');
+  const oc = old ? old.card : {};
+  let type = old ? old.type : 'truck';
+  const vehicles = await DB.all('vehicles');
+  const custList = h('datalist', { id: 'custs' }, [...new Set(vehicles.map(v => v.customer).filter(Boolean))].map(c => h('option', { value: c })));
+  const driver = h('input', { class: 'input', placeholder: 'שם הנהג שהביא את הרכב', value: oc.driver || '', autocomplete: 'off' });
+  const customer = h('input', { class: 'input', list: 'custs', placeholder: 'חברה או שם בעל הרכב', value: old ? old.customer || '' : '', autocomplete: 'off' });
+  const code = h('input', { class: 'input', placeholder: 'קוד', value: oc.code || '', autocomplete: 'off' });
+  const km = h('input', { class: 'input', inputmode: 'numeric', placeholder: 'מד אוץ – קילומטרים', value: old && old.km ? fmtNum(old.km) : '', autocomplete: 'off' });
+  km.addEventListener('input', () => { const d = km.value.replace(/\D/g, ''); km.value = d ? fmtNum(+d) : ''; });
+  const kmHint = h('p', { class: 'hint', hidden: true });
+  const kmWrap = h('div', {}, h('label', { class: 'lbl' }, 'מד אוץ (ק״מ)'), micFor(km, { numeric: true }), kmHint);
+  const typeChips = h('div', { class: 'chips' });
+  const renderType = () => {
+    fill(typeChips, ...[['truck', 'משאית'], ['trailer', 'נגרר']].map(([t, l]) => h('button', { type: 'button', class: 'chip' + (type === t ? ' on' : ''), style: 'min-height:50px;font-size:18px;padding:0 26px', onclick: () => { type = t; renderType(); } }, l)));
+    kmWrap.hidden = type !== 'truck';
+  };
+  const known = h('div', { class: 'known', hidden: true });
+  const plate = PlateField(lookup, { value: old && old.plate, keepPhoto: true });
+  async function lookup(p) {
+    known.hidden = true; kmHint.hidden = true;
+    if (p.length < 5) return;
+    const v = await DB.get('vehicles', p);
+    const openCard = (await DB.byPlate(p)).find(r => isOpenCard(r) && (!old || r.id !== old.id));
+    if (!v && !openCard) return;
+    if (v && !old) { if (!customer.value && v.customer) customer.value = v.customer; if (v.type && v.type !== type) { type = v.type; renderType(); } }
+    if (v && v.lastKm) { kmHint.hidden = false; kmHint.textContent = 'קילומטרים בטיפול הקודם: ' + fmtNum(v.lastKm); }
+    known.hidden = false;
+    fill(known, v && h('div', {}, h('b', {}, '✓ רכב מוכר במוסך'), v.customer ? ' – ' + v.customer : ''),
+      openCard && h('div', { style: 'margin-top:6px;color:var(--danger);font-weight:700' }, '⚠️ לרכב הזה כבר יש כרטיס פתוח מ-' + fmtDate(openCard.createdAt) + '. ',
+        h('a', { href: '#/report/' + openCard.id }, 'פתח אותו')));
+  }
+  const ph = Photos(b => { if (!plate.value()) plate.recognize(b, true); });
+  const oldPhotos = old ? (await Promise.all((oc.photos || []).map(blobURL))).filter(Boolean) : [];
+  const complaints = ListField('תלונות הנהג', 'מה הנהג אומר שלא תקין?', oc.complaints);
+  const insp = ListField('בחינה – מה צריך להחליף ולעשות', 'לדוגמה: להחליף רפידות בלם קדמיות', oc.inspection,
+    'כאן בודקים את הרכב, עושים דיאגנוסטיקה וכותבים מה צריך להחליף ולעשות. אפשר למלא גם אחר כך.');
+  const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), old ? 'שמור כרטיס' : 'פתח כרטיס');
+  fill(view,
+    h('div', { class: 'card' },
+      h('label', { class: 'lbl', style: 'margin-top:0' }, 'סוג הרכב'), typeChips,
+      h('label', { class: 'lbl' }, 'תמונה של הרכב ומספר רישוי ', h('span', { class: 'req' }, '*')), plate.el, known,
+      h('label', { class: 'lbl' }, 'שם הנהג'), micFor(driver),
+      h('label', { class: 'lbl' }, 'שם הלקוח'), micFor(customer), custList,
+      h('label', { class: 'lbl' }, 'קוד'), micFor(code),
+      kmWrap),
+    complaints.el, insp.el,
+    h('div', { class: 'card' }, h('h3', {}, 'תמונות נוספות של הרכב (לא חובה)'), oldPhotos.length ? photoGrid(oldPhotos) : null, ph.el),
+    saveBtn);
+  renderType();
+  if (old) lookup(old.plate);
+  dirtyCheck = () => !old && !!(plate.value() || driver.value || customer.value || complaints.get().length || ph.list.length);
+  saveBtn.onclick = async () => {
+    const p = plate.value();
+    if (p.length < 5) { alert('הכנס מספר רישוי (או צלם את הרכב).'); plate.input.focus(); return; }
+    saveBtn.disabled = true; fill(saveBtn, h('span', { class: 'spin' }), ' שומר…');
+    try {
+      const now = Date.now(), photos = [];
+      for (const x of ph.list) photos.push(await saveBlob(x.blob));
+      const kmVal = type === 'truck' ? (+km.value.replace(/\D/g, '') || null) : null;
+      const card = { driver: driver.value.trim(), code: code.value.trim(), complaints: complaints.get(), inspection: insp.get() };
+      const w = { id: myEid(), name: (me && me.name) || '' };
+      let r;
+      if (!old) {
+        r = { id: uid(), type, plate: p, customer: customer.value.trim(), model: '', km: kmVal, createdAt: now, updatedAt: now, workAt: now,
+          createdBy: w.id, createdByName: w.name, plateImage: plate.state.image ? await saveBlob(plate.state.image) : null, service: 'card',
+          card: { ...card, photos, status: 'inspect', statusLog: [{ at: now, status: 'inspect', byName: w.name }] },
+          entries: [], log: [{ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'create' }] };
+      } else {
+        r = await DB.get('reports', id);
+        const changes = [];
+        const ch = (field, from, to) => { if (String(from || '') !== String(to || '')) changes.push({ field, from: String(from || ''), to: String(to || '') }); };
+        ch('מספר רישוי', r.plate, p); ch('לקוח', r.customer, customer.value.trim()); ch('ק״מ', r.km, kmVal); ch('נהג', r.card.driver, card.driver); ch('קוד', r.card.code, card.code);
+        ch('תלונות', (r.card.complaints || []).join(' · '), card.complaints.join(' · ')); ch('בחינה', (r.card.inspection || []).join(' · '), card.inspection.join(' · '));
+        Object.assign(r, { type, plate: p, customer: customer.value.trim(), km: kmVal, updatedAt: now });
+        if (plate.state.image) r.plateImage = await saveBlob(plate.state.image);
+        r.card = { ...r.card, ...card, photos: [...(r.card.photos || []), ...photos] };
+        r.log.push({ at: now, workerId: w.id, workerName: w.name, ...actor(), action: 'card', changes });
+      }
+      await DB.put('reports', r); await upsertVehicle(r);
+      if (!old) notifyAdmins('report', r.id);
+      dirtyCheck = null; toast(old ? 'הכרטיס עודכן ✓' : 'הכרטיס נפתח ✓', 'ok'); go('#/report/' + r.id);
+    } catch (e) { console.error(e); alert('השמירה נכשלה: ' + niceErr(e)); saveBtn.disabled = false; fill(saveBtn, ic('check'), old ? 'שמור כרטיס' : 'פתח כרטיס'); }
+  };
+}
+async function setCardStatus(id, st) {
+  try {
+    const r = await DB.get('reports', id); const now = Date.now();
+    r.card.status = st; r.card.statusLog = [...(r.card.statusLog || []), { at: now, status: st, byName: (me && me.name) || '' }];
+    r.updatedAt = now; await DB.put('reports', r);
+    toast(CARD_STATUS[st], 'ok'); route();
+  } catch (e) { alert(niceErr(e)); }
+}
+async function cardSection(r, compact) {
+  const c = r.card; if (!c) return null;
+  const list = (title, arr) => arr && arr.length ? h('div', {}, h('div', { class: 'sec-title' }, title), h('ol', { class: 'card-ol' }, arr.map(x => h('li', {}, x)))) : null;
+  const urls = compact ? [] : (await Promise.all((c.photos || []).map(blobURL))).filter(Boolean);
+  const admin = isAdmin() && !compact;
+  return h('div', { class: 'card', style: 'border:2px solid var(--brand2)' },
+    h('div', { class: 'item-top' }, h('h3', { style: 'margin:0', class: 'grow' }, '🗂️ כרטיס עבודה'), cardTag(c.status)),
+    h('dl', { class: 'kv' },
+      h('dt', {}, 'נהג'), h('dd', {}, c.driver || '—'),
+      h('dt', {}, 'לקוח'), h('dd', {}, r.customer || '—'),
+      h('dt', {}, 'קוד'), h('dd', {}, c.code || '—'),
+      r.type === 'truck' && [h('dt', {}, 'מד אוץ'), h('dd', {}, r.km ? fmtNum(r.km) + ' ק״מ' : '—')],
+      !compact && [h('dt', {}, 'סטטוס'), h('dd', {}, CARD_STATUS[c.status] || c.status)]),
+    list('תלונות הנהג', c.complaints),
+    list('בחינה – מה צריך להחליף ולעשות', c.inspection) || (!compact && h('p', { class: 'hint' }, 'עוד לא נרשמה בחינה.')),
+    urls.length ? h('div', {}, h('div', { class: 'sec-title' }, 'תמונות הרכב'), photoGrid(urls)) : null,
+    !compact && (c.statusLog || []).length > 1 && h('ul', { class: 'log', style: 'margin-top:10px' }, c.statusLog.slice().reverse().map(l => h('li', {}, h('b', {}, fmtDT(l.at)), ' · ', CARD_SHORT[l.status] || l.status, l.byName ? ' · ' + l.byName : ''))),
+    admin && h('div', { class: 'row', style: 'margin-top:12px' },
+      c.status === 'inspect' && h('button', { type: 'button', class: 'btn ok', onclick: () => setCardStatus(r.id, 'approved') }, ic('check'), 'הלקוח אישר – העבר לעבודה'),
+      c.status === 'approved' && h('button', { type: 'button', class: 'btn primary', onclick: () => { if (confirm('לסגור את הכרטיס? הרכב יוצא מרשימת הכרטיסים הפתוחים.')) setCardStatus(r.id, 'closed'); } }, 'סגור כרטיס – הרכב יצא'),
+      c.status !== 'inspect' && h('button', { type: 'button', class: 'btn sm', onclick: () => setCardStatus(r.id, c.status === 'closed' ? 'approved' : 'inspect') }, c.status === 'closed' ? 'פתח מחדש' : 'החזר לבדיקה'),
+      h('a', { class: 'btn sm', href: '#/cards/' + r.id + '/edit' }, ic('edit'), 'ערוך כרטיס / בחינה')));
+}
 async function showVehicleSheet(plate) {
   const reps = (await DB.byPlate(plate)).sort((a, b) => workTime(b) - workTime(a));
   const s = openSheet('טיפולים קודמים – ' + fmtPlate(plate), h('div'));
@@ -1520,9 +1707,10 @@ async function viewVehicle(p) {
 async function viewReport(id) {
   const r = await DB.get('reports', id);
   if (!r) { setHeader('', 'דיווח'); fill(view, h('div', { class: 'empty' }, 'הדיווח לא נמצא')); return; }
-  setHeader('', typeName(r.type) + ' ' + fmtPlate(r.plate));
+  setHeader('', (r.card ? 'כרטיס ' : '') + typeName(r.type) + ' ' + fmtPlate(r.plate), r.card ? '#/cards' : undefined);
   fill(view,
-    h('a', { class: 'btn big primary', href: '#/report/' + id + '/add', style: 'margin-bottom:10px' }, ic('plus'), 'הוסף עבודה / הקלטה / תמונות'),
+    r.card && await cardSection(r),
+    h('a', { class: 'btn big primary', href: '#/report/' + id + '/add', style: 'margin-bottom:10px' }, ic('plus'), r.card ? 'רשום עבודה / הקלטה / תמונות' : 'הוסף עבודה / הקלטה / תמונות'),
     (canEditDetails(r) || r.entries.some(canEditEntry))
       ? h('a', { class: 'btn wide', href: '#/report/' + id + '/edit', style: 'margin-bottom:14px' }, ic('edit'), isAdmin() ? 'תקן או מחק בדיווח' : 'תקן טעות בעבודה שלי')
       : h('p', { class: 'hint', style: 'margin:0 0 14px' }, 'אפשר להוסיף עבודה לדיווח הזה. תיקון של עבודה שרשם עובד אחר – רק מנהל.'),
@@ -1552,6 +1740,7 @@ async function viewAdd(id) {
   const wd = WorkDate();
   const saveBtn = h('button', { type: 'button', class: 'btn big ok' }, ic('check'), 'שמור תוספת');
   fill(view,
+    r.card && await cardSection(r, true),
     h('div', { class: 'card' }, h('div', { class: 'item-top' }, plateBadge(r.plate), typeTag(r.type), h('span', {}, r.customer || '')),
       h('p', { class: 'hint' }, 'הדיווח נפתח ב-' + fmtDT(r.createdAt) + '. מה שנרשם קודם נשאר כמו שהוא – התוספת תישמר בנפרד עם השם והשעה.'),
       h('label', { class: 'lbl', style: 'margin-top:12px' }, 'סוג התוספת'), kinds),
@@ -1719,12 +1908,13 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
     .sort((a, b) => workTime(a.entries[0]) - workTime(b.entries[0]));
   let orders = [];
   try { orders = (await DB.all('orders')).filter(o => o.createdAt >= from && o.createdAt <= to).sort((a, b) => a.createdAt - b.createdAt); } catch { }
-  if (!reports.length && !orders.length) { fill(status, 'אין עבודות או הזמנות בין התאריכים האלה.'); return; }
+  const cardsIn = (await DB.all('reports')).filter(r => r.card && r.createdAt >= from && r.createdAt <= to).sort((a, b) => a.createdAt - b.createdAt);
+  if (!reports.length && !orders.length && !cardsIn.length) { fill(status, 'אין עבודות או הזמנות בין התאריכים האלה.'); return; }
   const files = [];   // { path, id }
   const rows = [], viewer = [];
   for (const { r, entries } of reports) {
     const folder = 'jobs/' + ymd(workTime(entries[0])) + '_' + r.plate + '_' + r.id.slice(0, 6) + '/';
-    const vjob = { rescue: r.service === 'rescue', where: r.location ? r.location.text || '' : '', plate: fmtPlate(r.plate), type: typeName(r.type), customer: r.customer || '', model: r.model || '', km: r.km || '', folder, entries: [], platePhoto: null };
+    const vjob = { card: r.card ? { driver: r.card.driver || '', code: r.card.code || '', complaints: r.card.complaints || [], inspection: r.card.inspection || [], status: CARD_SHORT[r.card.status] || '' } : null, rescue: r.service === 'rescue', where: r.location ? r.location.text || '' : '', plate: fmtPlate(r.plate), type: typeName(r.type), customer: r.customer || '', model: r.model || '', km: r.km || '', folder, entries: [], platePhoto: null };
     if (r.plateImage) { vjob.platePhoto = folder + 'plate.jpg'; files.push({ path: vjob.platePhoto, id: r.plateImage }); }
     entries.forEach((e, n) => {
       const i = r.entries.indexOf(e);
@@ -1734,11 +1924,12 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
       const recs = e.recordings.map((rc, k) => { const path = folder + tag + '-recording-' + (k + 1) + '.' + extOf(rc.mime || ''); files.push({ path, id: rc.blobId }); return { path, transcript: rc.transcript || '' }; });
       rows.push({
         'תאריך העבודה': ymd(workTime(e)), 'שעה': fmtTime(workTime(e)), 'נרשם במערכת': fmtDT(e.at),
-        'שירות': r.service === 'rescue' ? 'חילוץ דרך' : 'עבודה במוסך', 'מיקום': r.service === 'rescue' && r.location ? [r.location.text, r.location.lat ? 'https://maps.google.com/?q=' + r.location.lat + ',' + r.location.lng : ''].filter(Boolean).join(' ') : '',
+        'שירות': r.service === 'rescue' ? 'חילוץ דרך' : r.card ? 'כרטיס עבודה' : 'עבודה במוסך', 'מיקום': r.service === 'rescue' && r.location ? [r.location.text, r.location.lat ? 'https://maps.google.com/?q=' + r.location.lat + ',' + r.location.lng : ''].filter(Boolean).join(' ') : '',
         'מספר רישוי': fmtPlate(r.plate), 'סוג': typeName(r.type), 'לקוח': r.customer || '', 'דגם': r.model || '', 'ק״מ': r.km || '',
         'עובד': e.workerName || '', 'הוזן ע״י': e.byName && e.byName !== e.workerName ? e.byName : '', 'סוג קטע': kind,
         'מה בוצע (טקסט)': e.text || '', 'תמלול הקלטות': recs.map(x => x.transcript).filter(Boolean).join(' | '),
         'תמונות': photos.length, 'הקלטות': recs.length, 'תיקייה': folder,
+        ...(r.card ? { 'נהג': r.card.driver || '', 'קוד': r.card.code || '', 'תלונות הנהג': (r.card.complaints || []).join(' | '), 'בחינה': (r.card.inspection || []).join(' | '), 'סטטוס כרטיס': CARD_SHORT[r.card.status] || '' } : {}),
       });
       vjob.entries.push({ kind, date: fmtDT(workTime(e)), entered: fmtDT(e.at), worker: e.workerName || '', by: e.byName && e.byName !== e.workerName ? e.byName : '', text: e.text || '', photos, recs });
     });
@@ -1794,6 +1985,16 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
   const wo = XLSX.utils.json_to_sheet(orderRows.length ? orderRows : [{ 'תאריך': '', 'הערות': 'אין הזמנות בתקופה' }]);
   wo['!cols'] = [16, 18, 26, 6, 6, 12, 14, 14, 60, 40, 40].map(w => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, wo, 'הזמנות חלקים');
+  const cardLog = (r, st) => { const l = (r.card.statusLog || []).filter(x => x.status === st).pop(); return l ? fmtDT(l.at) + (l.byName ? ' (' + l.byName + ')' : '') : ''; };
+  const wk = XLSX.utils.json_to_sheet(cardsIn.length ? cardsIn.map(r => ({
+    'נפתח': fmtDT(r.createdAt), 'נפתח ע״י': r.createdByName || '', 'מספר רישוי': fmtPlate(r.plate), 'סוג': typeName(r.type), 'לקוח': r.customer || '',
+    'נהג': r.card.driver || '', 'קוד': r.card.code || '', 'ק״מ': r.km || '', 'תלונות הנהג': (r.card.complaints || []).map((x, i) => (i + 1) + '. ' + x).join('\n'),
+    'בחינה': (r.card.inspection || []).map((x, i) => (i + 1) + '. ' + x).join('\n'), 'סטטוס': CARD_SHORT[r.card.status] || '',
+    'אושר ע״י הלקוח': cardLog(r, 'approved'), 'נסגר': cardLog(r, 'closed'),
+    'עבודות שנרשמו': r.entries.filter(e => e.kind !== 'note').length, 'עובדים': [...new Set(r.entries.map(e => e.workerName).filter(Boolean))].join(', ') }))
+    : [{ 'נפתח': '', 'בחינה': 'אין כרטיסים שנפתחו בתקופה' }]);
+  wk['!cols'] = [16, 12, 12, 8, 20, 14, 10, 10, 40, 40, 10, 20, 20, 10, 24].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, wk, 'כרטיסים');
   XLSX.utils.book_append_sheet(wb, wf, 'אוכל');
   zip.file('עבודות.xlsx', XLSX.write(wb, { bookType: 'xlsx', type: 'array' }));
   // offline viewer page
@@ -1802,7 +2003,7 @@ async function exportRange(from, to, fromTxt, toTxt, status) {
   const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } }, m => say('אורז ' + Math.round(m.percent) + '%…'));
   const name = 'מוסך-טארק_' + fromTxt + '_עד_' + toTxt + '.zip';
   const file = new File([blob], name, { type: 'application/zip' });
-  fill(status, '✓ מוכן: ' + rows.length + ' עבודות, ' + orders.length + ' הזמנות, ' + (files.length - missing) + ' קבצים' + (missing ? ' (' + missing + ' קבצים לא נמצאו)' : '') + ' · ' + (blob.size / 1048576).toFixed(1) + ' MB');
+  fill(status, '✓ מוכן: ' + rows.length + ' עבודות, ' + cardsIn.length + ' כרטיסים, ' + orders.length + ' הזמנות, ' + (files.length - missing) + ' קבצים' + (missing ? ' (' + missing + ' קבצים לא נמצאו)' : '') + ' · ' + (blob.size / 1048576).toFixed(1) + ' MB');
   const a = h('a', { href: URL.createObjectURL(file), download: name }); document.body.append(a); a.click(); a.remove();
   if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], title: name }); } catch { }
@@ -1812,6 +2013,7 @@ function offlinePage(jobs, fromTxt, toTxt, orders = []) {
   const card = j => `<section class="job" data-s="${esc((j.plate + ' ' + j.customer + ' ' + j.model + ' ' + j.entries.map(e => e.worker + ' ' + e.text + ' ' + e.recs.map(r => r.transcript).join(' ')).join(' ')).toLowerCase())}">
   <h2>${j.rescue ? '<span class="res">חילוץ דרך</span> ' : ''}<span class="plate">${esc(j.plate)}</span> ${esc(j.type)} · ${esc(j.customer || 'ללא שם לקוח')}${j.model ? ' · ' + esc(j.model) : ''}${j.km ? ' · ' + esc(j.km) + ' ק״מ' : ''}</h2>
   ${j.rescue && j.where ? `<div class="m">מיקום: ${esc(j.where)}</div>` : ''}
+  ${j.card ? `<div class="m">כרטיס עבודה (${esc(j.card.status)}) · נהג: ${esc(j.card.driver || '—')} · קוד: ${esc(j.card.code || '—')}</div>${j.card.complaints.length ? `<p><b>תלונות הנהג:</b> ${j.card.complaints.map(esc).join(' · ')}</p>` : ''}${j.card.inspection.length ? `<p><b>בחינה:</b> ${j.card.inspection.map(esc).join(' · ')}</p>` : ''}` : ''}
   ${j.platePhoto ? `<a href="${esc(j.platePhoto)}"><img class="pp" src="${esc(j.platePhoto)}" alt=""></a>` : ''}
   ${j.entries.map(e => `<div class="e"><b>${esc(e.kind)}</b> · בוצע ${esc(e.date)} · ${esc(e.worker)}${e.by ? ' (הוזן ע״י ' + esc(e.by) + ')' : ''} <span class="m">נרשם ${esc(e.entered)}</span>
     ${e.text ? `<p>${esc(e.text)}</p>` : ''}
@@ -1851,7 +2053,7 @@ async function adminWorks(body) {
     cust: h('input', { class: 'input', placeholder: 'שם לקוח' }),
     worker: h('select', { class: 'input' }, h('option', { value: '' }, 'כל העובדים'), emps.map(e => h('option', { value: e.id }, e.name))),
     type: h('select', { class: 'input' }, h('option', { value: '' }, 'משאיות ונגררים'), h('option', { value: 'truck' }, 'משאיות'), h('option', { value: 'trailer' }, 'נגררים')),
-    service: h('select', { class: 'input' }, h('option', { value: '' }, 'עבודות וחילוצים'), h('option', { value: 'work' }, 'עבודות מוסך'), h('option', { value: 'rescue' }, 'חילוצי דרך')),
+    service: h('select', { class: 'input' }, h('option', { value: '' }, 'הכל'), h('option', { value: 'work' }, 'עבודות מוסך'), h('option', { value: 'rescue' }, 'חילוצי דרך'), h('option', { value: 'card' }, 'כרטיסי עבודה')),
     from: h('input', { class: 'input', type: 'date' }), to: h('input', { class: 'input', type: 'date' }),
   };
   const out = h('div');
@@ -1860,8 +2062,8 @@ async function adminWorks(body) {
     const from = f.from.value ? new Date(f.from.value + 'T00:00').getTime() : 0;
     const to = f.to.value ? new Date(f.to.value + 'T23:59:59').getTime() : Infinity;
     const res = reps.filter(r => (!pd || r.plate.includes(pd)) && (!c || (r.customer || '').includes(c)) && (!t || r.type === t) &&
-      (!sv || (sv === 'rescue') === (r.service === 'rescue')) &&
-      (!w || r.entries.some(e => e.workerId === w)) && r.entries.some(e => workTime(e) >= from && workTime(e) <= to));
+      (!sv || (r.service || 'work') === sv) &&
+      (!w || r.entries.some(e => e.workerId === w)) && (r.entries.length ? r.entries : [r]).some(e => workTime(e) >= from && workTime(e) <= to));
     fill(out, h('h3', { style: 'margin:6px 2px 10px' }, 'נמצאו ' + res.length + ' עבודות'), res.length ? res.map(r => reportItem(r)) : h('div', { class: 'empty' }, 'אין תוצאות'));
   };
   Object.values(f).forEach(x => x.addEventListener('input', run));
